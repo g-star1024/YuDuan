@@ -7,3 +7,7 @@
 .DS_Store
 Thumbs.db
 *.swp
+
+# 编译产物（Go 构建二进制，按需本地生成）
+dev/bin/
+*.exe
