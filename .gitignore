@@ -1,0 +1,9 @@
+# 御端 YuDuan — 仓库忽略规则
+
+# 内部运维记忆与开发交接日志（非交付物，含本地路径等敏感信息）
+.workbuddy/memory/
+
+# 操作系统 / 编辑器碎片
+.DS_Store
+Thumbs.db
+*.swp
