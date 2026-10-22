@@ -103,7 +103,30 @@ func run(hubURL, token string) error {
 			if err := env.DecodePayload(&c); err != nil {
 				continue
 			}
-			go handleCommand(conn, c)
+			if c.Action == "sw_install" {
+				go handleSwInstall(conn, c)
+			} else {
+				go handleCommand(conn, c)
+			}
+		}
+
+		// —— M4 远程控制 ——
+		switch env.Type {
+		case proto.TypeRCRequest:
+			var p proto.RCRequestPayload
+			if err := env.DecodePayload(&p); err != nil {
+				continue
+			}
+			log.Printf("[agent] rc request session=%s operator=%s", p.SessionID, p.Operator)
+			go startRC(conn, p.SessionID)
+		case proto.TypeRCInput:
+			var p proto.RCInputPayload
+			if err := env.DecodePayload(&p); err != nil {
+				continue
+			}
+			applyInput(conn, p.SessionID, p)
+		case proto.TypeRCStop:
+			stopRC()
 		}
 	}
 }

@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>御端 · 远程控制（M4 演示）</title>
+  <style>
+    :root { --bg:#f4f5fa; --card:#fff; --line:#e4e7ef; --text:#1f2430; --muted:#6b7280; --brand:#1e3a8a; --ok:#16a34a; --warn:#d97706; }
+    * { box-sizing:border-box; }
+    body { margin:0; font-family:-apple-system,"PingFang SC","Microsoft YaHei",Helvetica,Arial,sans-serif; background:var(--bg); color:var(--text); }
+    header { padding:16px 24px; background:var(--brand); color:#fff; display:flex; align-items:center; justify-content:space-between; }
+    header h1 { font-size:18px; margin:0; font-weight:600; }
+    nav a { color:#fff; margin-left:16px; text-decoration:none; font-size:13px; opacity:.9; }
+    nav a:hover { opacity:1; }
+    main { padding:20px 24px; max-width:1200px; margin:0 auto; }
+    .bar { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-bottom:14px; }
+    select, input, button { padding:8px 10px; border:1px solid var(--line); border-radius:10px; font-size:13px; background:#fff; }
+    button { background:var(--brand); color:#fff; border:none; cursor:pointer; }
+    button:hover { opacity:.92; }
+    button.ghost { background:#fff; color:var(--brand); border:1px solid var(--brand); }
+    .layout { display:flex; gap:16px; }
+    .screen { flex:1; background:#0f172a; border-radius:14px; padding:8px; min-height:520px; display:flex; align-items:center; justify-content:center; }
+    canvas { max-width:100%; max-height:520px; border-radius:8px; background:#000; cursor:crosshair; }
+    .side { width:320px; display:flex; flex-direction:column; gap:14px; }
+    .card { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:14px; }
+    .card h3 { font-size:14px; margin:0 0 8px; }
+    .log { font-size:12px; color:var(--muted); height:300px; overflow:auto; background:#0f172a; color:#e2e8f0; border-radius:10px; padding:10px; white-space:pre-wrap; }
+    .hint { font-size:12px; color:var(--muted); }
+    .status { font-size:12px; color:var(--warn); }
+  </style>
+</head>
+<body>
+  <header>
+    <div><h1>御端 · 远程控制</h1></div>
+    <nav><a href="/">资产管理</a><a href="/software.html">软件分发</a></nav>
+  </header>
+  <main>
+    <div class="bar">
+      <select id="deviceSel"><option value="">选择被控设备…</option></select>
+      <button id="startBtn">发起远控</button>
+      <button id="stopBtn" class="ghost">结束会话</button>
+      <span id="status" class="status"></span>
+    </div>
+    <div class="layout">
+      <div class="screen"><canvas id="screen" width="1280" height="800"></canvas></div>
+      <div class="side">
+        <div class="card">
+          <h3>操作提示</h3>
+          <p class="hint">在画面内移动/点击鼠标、键入字符即向被控端发送输入。被控端会弹出远端提示，员工可拒绝。</p>
+        </div>
+        <div class="card">
+          <h3>会话事件 / 合规日志</h3>
+          <div id="log" class="log">—</div>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <script>
+    let ws = null;
+    let sessionID = null;
+    let frameW = 1280, frameH = 800;
+    const canvas = document.getElementById('screen');
+    const ctx = canvas.getContext('2d');
+    const logEl = document.getElementById('log');
+    const statusEl = document.getElementById('status');
+
+    function log(msg) {
+      const t = new Date().toLocaleTimeString('zh-CN');
+      logEl.textContent += `[${t}] ${msg}\n`;
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    async function refreshDevices() {
+      const dev = await fetch('/api/v1/devices').then(r => r.json());
+      const sel = document.getElementById('deviceSel');
+      sel.innerHTML = '<option value="">选择被控设备…</option>' +
+        (dev.devices || []).map(d => `<option value="${d.id}">${d.hostname} (${d.os}/${d.arch}) ${d.online?'在线':'离线'}</option>`).join('');
+    }
+
+    function connect() {
+      if (ws) ws.close();
+      const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+      ws = new WebSocket(`${proto}://${location.host}/ws/viewer`);
+      ws.onmessage = (ev) => {
+        const env = JSON.parse(ev.data);
+        if (env.type === 'rc_frame') {
+          const p = env.payload;
+          frameW = p.width; frameH = p.height;
+          const img = new Image();
+          img.onload = () => ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+          img.src = 'data:image/jpeg;base64,' + p.data;
+        } else if (env.type === 'rc_event') {
+          const p = env.payload;
+          log(`事件[${p.kind}]: ${p.message}` + (p.require_consent ? '（需员工确认）' : ''));
+          if (p.kind === 'consent_required') statusEl.textContent = '等待员工确认…';
+          if (p.kind === 'consent_granted') statusEl.textContent = '已获授权，画面传输中';
+          if (p.kind === 'error') statusEl.textContent = p.message;
+        } else if (env.type === 'rc_ready') {
+          log(`被控端就绪 ok=${env.payload.ok}`);
+        } else if (env.type === 'rc_stop') {
+          log('会话已结束');
+        }
+      };
+      ws.onclose = () => log('viewer 连接关闭');
+    }
+
+    document.getElementById('startBtn').onclick = () => {
+      const id = document.getElementById('deviceSel').value;
+      if (!id) { alert('请先选择被控设备'); return; }
+      connect();
+      sessionID = 's-' + Math.random().toString(36).slice(2, 10);
+      const env = { ver:1, msg_id:'m'+Date.now(), ts:Math.floor(Date.now()/1000), type:'rc_request', seq:1,
+        payload:{ device_id:id, session_id:sessionID, operator:'admin' } };
+      ws.onopen = () => { ws.send(JSON.stringify(env)); log('已发送远控请求'); };
+    };
+
+    document.getElementById('stopBtn').onclick = () => {
+      if (ws && sessionID) {
+        const env = { ver:1, msg_id:'m'+Date.now(), ts:Math.floor(Date.now()/1000), type:'rc_stop', seq:1, payload:{ session_id:sessionID } };
+        ws.send(JSON.stringify(env));
+      }
+      if (ws) ws.close();
+      sessionID = null;
+    };
+
+    function sendInput(kind, extra) {
+      if (!ws || !sessionID) return;
+      const env = { ver:1, msg_id:'m'+Date.now(), ts:Math.floor(Date.now()/1000), type:'rc_input', seq:1,
+        payload: Object.assign({ session_id:sessionID, kind }, extra) };
+      ws.send(JSON.stringify(env));
+    }
+
+    canvas.addEventListener('mousemove', (e) => {
+      const r = canvas.getBoundingClientRect();
+      const x = Math.round((e.clientX - r.left) / r.width * frameW);
+      const y = Math.round((e.clientY - r.top) / r.height * frameH);
+      sendInput('mouse_move', { x, y });
+    });
+    canvas.addEventListener('mousedown', (e) => sendInput('mouse_down', { button:e.button, x:0, y:0 }));
+    canvas.addEventListener('mouseup', (e) => sendInput('mouse_up', { button:e.button, x:0, y:0 }));
+    document.addEventListener('keydown', (e) => {
+      if (document.activeElement === canvas || e.target === document.body) {
+        sendInput('key_press', { key: e.key });
+      }
+    });
+
+    refreshDevices();
+    setInterval(refreshDevices, 5000);
+  </script>
+</body>
+</html>

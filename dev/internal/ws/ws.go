@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 )
 
 const guid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
@@ -23,6 +24,7 @@ type Conn struct {
 	conn    net.Conn
 	buf     *bufio.Reader
 	isClient bool
+	wmu     sync.Mutex // 写锁：远控中继需多 goroutine 并发写同一连接
 }
 
 // Upgrade 在服务端将 HTTP 连接升级为 WebSocket（HTTP Hijack 实现）。
@@ -164,6 +166,8 @@ func (c *Conn) ReadMessage() ([]byte, error) {
 
 // WriteMessage 发送一帧文本消息。
 func (c *Conn) WriteMessage(data []byte) error {
+	c.wmu.Lock()
+	defer c.wmu.Unlock()
 	var hdr []byte
 	var maskBit byte
 	if c.isClient {
@@ -215,6 +219,8 @@ func (c *Conn) WriteClose() error {
 }
 
 func (c *Conn) writeControl(opcode byte, data []byte) error {
+	c.wmu.Lock()
+	defer c.wmu.Unlock()
 	hdr := []byte{0x80 | opcode, byte(len(data))}
 	if c.isClient {
 		hdr[1] |= 0x80

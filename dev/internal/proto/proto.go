@@ -27,6 +27,17 @@ const (
 	TypeAck         = "ack"
 	TypeResult      = "result"
 	TypeEvent       = "event"
+
+	// —— M4 远程控制 ——
+	TypeRCRequest = "rc_request" // Viewer→Hub / Hub→Agent：请求开启远控会话
+	TypeRCReady   = "rc_ready"   // Agent→Hub→Viewer：被控端就绪
+	TypeRCFrame   = "rc_frame"   // Agent→Hub→Viewer：屏幕帧（JPEG base64）
+	TypeRCInput   = "rc_input"   // Viewer→Hub→Agent：键鼠输入
+	TypeRCStop    = "rc_stop"    // 任一端→对端：结束会话
+	TypeRCEvent   = "rc_event"   // Agent→Hub→Viewer：合规提示/员工确认事件
+
+	// —— M5 软件分发 ——
+	// sw_install 复用 TypeCommand(action="sw_install")，载荷见 CommandPayload 扩展字段
 )
 
 // RegisterPayload —— Agent→Hub 的纳管注册信息（首次/重连）。
@@ -58,11 +69,73 @@ type HeartbeatPayload struct {
 	IP   string  `json:"ip"`
 }
 
-// CommandPayload —— Hub→Agent 的指令（shell / collect / 后续 sw_install 等）。
+// CommandPayload —— Hub→Agent 的指令（shell / collect / sw_install）。
 type CommandPayload struct {
-	Action  string `json:"action"` // shell / collect
-	TaskID  string `json:"task_id"`
-	Command string `json:"command,omitempty"`
+	Action     string `json:"action"` // shell / collect / sw_install
+	TaskID     string `json:"task_id"`
+	Command    string `json:"command,omitempty"`
+	SoftwareURL string `json:"software_url,omitempty"` // sw_install：下载地址
+	Platform   string `json:"platform,omitempty"`     // sw_install：目标平台 windows/macos/linux
+	PkgName    string `json:"pkg_name,omitempty"`     // sw_install：包名/文件名
+}
+
+// —— M4 远程控制载荷 ——
+
+// RCRequestPayload —— 请求开启远控会话。Operator 为管理员标识（审计用）。
+type RCRequestPayload struct {
+	DeviceID string `json:"device_id"`
+	SessionID string `json:"session_id"`
+	Operator string  `json:"operator"`
+}
+
+// RCReadyPayload —— 被控端捕获就绪。
+type RCReadyPayload struct {
+	SessionID string `json:"session_id"`
+	OK        bool   `json:"ok"`
+	Reason    string `json:"reason,omitempty"`
+}
+
+// RCFramePayload —— 一帧屏幕画面（JPEG 经 base64 编码）。
+type RCFramePayload struct {
+	SessionID string `json:"session_id"`
+	Seq       int64  `json:"seq"`
+	Width     int    `json:"width"`
+	Height    int    `json:"height"`
+	Format    string `json:"format"` // "jpeg"
+	Data      string `json:"data"`   // base64(jpeg bytes)
+	TS        int64  `json:"ts"`
+}
+
+// RCInputPayload —— 键鼠输入事件。
+type RCInputPayload struct {
+	SessionID string `json:"session_id"`
+	Kind      string `json:"kind"` // mouse_move / mouse_down / mouse_up / mouse_wheel / key_down / key_up / key_press
+	X         int    `json:"x,omitempty"`
+	Y         int    `json:"y,omitempty"`
+	Button    int    `json:"button,omitempty"`
+	Key       string `json:"key,omitempty"` // 按键（字母/数字/特殊键名）
+}
+
+// RCEventPayload —— 合规/确认事件。Kind: consent_required / consent_granted / notice。
+type RCEventPayload struct {
+	SessionID      string `json:"session_id"`
+	Kind           string `json:"kind"`
+	Message        string `json:"message"`
+	RequireConsent bool   `json:"require_consent,omitempty"`
+	Consented      bool   `json:"consented,omitempty"`
+}
+
+// —— M5 软件分发载荷 ——
+
+// SoftwareItem 软件仓库目录项（与 hub 内存目录对应）。
+type SoftwareItem struct {
+	ID         string `json:"id"`
+	Name       string `json:"name"`
+	Version    string `json:"version"`
+	Platform   string `json:"platform"` // windows / macos / linux / any
+	FileName   string `json:"file_name"`
+	Size       int64  `json:"size"`
+	UploadedAt int64  `json:"uploaded_at"`
 }
 
 // ResultPayload —— Agent→Hub 的执行结果。

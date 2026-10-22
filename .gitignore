@@ -11,3 +11,6 @@ Thumbs.db
 # 编译产物（Go 构建二进制，按需本地生成）
 dev/bin/
 *.exe
+
+# 运行时数据（软件仓库落盘、Agent 临时下载/解包，非源码）
+dev/data/
