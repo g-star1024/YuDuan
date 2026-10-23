@@ -24,3 +24,7 @@ rust/agent/target/
 
 # SCA 扫描器编译产物（本地生成的静态分析二进制）
 dev/sca
+
+# 编码器/测试编译产物（源码与 build.sh 入库，二进制不入）
+dev/encoder-vt/*.dylib
+dev/encoder-vt/harness
