@@ -21,3 +21,6 @@ dev/certs/
 
 # Rust 副端编译产物（rustc 离线构建输出）
 rust/agent/target/
+
+# SCA 扫描器编译产物（本地生成的静态分析二进制）
+dev/sca

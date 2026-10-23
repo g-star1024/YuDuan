@@ -3,9 +3,13 @@
 //   macOS: .pkg → installer -pkg -target / ；.zip → 解包（ditto/unzip），含 .app 则复制到 /Applications
 //   Linux: .deb → dpkg -i（无 root 时 sudo -n）；.rpm → rpm -i；.sh → bash
 //   Windows: .msi → msiexec /i /qn /norestart；.exe → 尽力以 /S 静默运行
-// 真实生产需管理员权限与签名校验（生产化清单见 README）。
+// 安全（生产化）：安装前校验包 SHA-256 与 Ed25519 签名（中枢 Go crypto/ed25519 签发，
+//   签名为「对 32 字节摘要原文」的签名；受信公钥来自指令 payload 或 YUDUAN_SW_PUBKEY）。
+//   哈希不符 exit_code=3，验签失败 exit_code=4，均拒绝安装并回报。
 
+use crate::ed25519;
 use crate::httpget::download_to_temp;
+use crate::sha256::sha256;
 use std::process::Command;
 
 pub struct InstallOutcome {
@@ -14,8 +18,20 @@ pub struct InstallOutcome {
     pub output_log: String,
 }
 
-/// 处理 sw_install 指令。
-pub fn handle_sw_install(url: &str, platform: &str, pkg_name: &str) -> InstallOutcome {
+/// 安装前校验参数（均可用空串跳过对应校验）。
+pub struct PkgVerify<'a> {
+    pub sha256: &'a str,    // 期望 SHA-256（hex）
+    pub signature: &'a str, // Ed25519 签名（hex），对「32 字节摘要原文」签名
+    pub pubkey: &'a str,    // 受信签名公钥（hex）
+}
+
+/// 处理 sw_install 指令：下载 → 校验 → 安装。
+pub fn handle_sw_install(
+    url: &str,
+    platform: &str,
+    pkg_name: &str,
+    verify: &PkgVerify,
+) -> InstallOutcome {
     if url.is_empty() {
         return InstallOutcome {
             state: "failed".into(),
@@ -50,9 +66,95 @@ pub fn handle_sw_install(url: &str, platform: &str, pkg_name: &str) -> InstallOu
         }
         _ => local,
     };
-    let out = install_package(&local, platform, pkg_name);
+
+    // —— 安全校验：先哈希、后验签，任一不符即拒绝安装 ——
+    let data = match std::fs::read(&local) {
+        Ok(d) => d,
+        Err(e) => {
+            let _ = std::fs::remove_file(&local);
+            return InstallOutcome {
+                state: "failed".into(),
+                exit_code: 2,
+                output_log: format!("read downloaded package failed: {}", e),
+            };
+        }
+    };
+    let logs = match verify_package(&data, verify) {
+        Ok(l) => l,
+        Err((code, reason)) => {
+            let _ = std::fs::remove_file(&local);
+            return InstallOutcome {
+                state: "failed".into(),
+                exit_code: code,
+                output_log: reason,
+            };
+        }
+    };
+
+    let mut out = install_package(&local, platform, pkg_name);
+    out.output_log = format!("{} | {}", logs.join(" | "), out.output_log);
     let _ = std::fs::remove_file(&local);
     out
+}
+
+/// 安装前校验（纯函数，便于单测）：SHA-256 比对 + Ed25519 验签。
+/// 返回 Ok(日志行) 或 Err((exit_code, 原因))。
+pub fn verify_package(data: &[u8], verify: &PkgVerify) -> Result<Vec<String>, (i64, String)> {
+    let digest = sha256(data);
+    let digest_hex = hex_lower(&digest);
+    let mut logs = vec![format!("sha256={}", digest_hex)];
+
+    if !verify.sha256.is_empty() {
+        let want = verify.sha256.trim().to_ascii_lowercase();
+        if want != digest_hex {
+            return Err((
+                3,
+                format!(
+                    "sha256 mismatch: expected {} got {}（包被篡改或信源不符，拒绝安装）",
+                    want, digest_hex
+                ),
+            ));
+        }
+        logs.push("sha256 ok".into());
+    }
+
+    if !verify.signature.is_empty() && !verify.pubkey.is_empty() {
+        let sig = match hex_decode(verify.signature) {
+            Some(s) if s.len() == 64 => s,
+            _ => return Err((4, "signature 字段非法（非 64 字节 hex）".into())),
+        };
+        let pk = match hex_decode(verify.pubkey) {
+            Some(p) if p.len() == 32 => p,
+            _ => return Err((4, "signer 公钥字段非法（非 32 字节 hex）".into())),
+        };
+        if !ed25519::verify(&pk, &digest, &sig) {
+            return Err((
+                4,
+                "Ed25519 验签失败：签名与包内容/受信公钥不匹配，拒绝安装".into(),
+            ));
+        }
+        logs.push("ed25519 signature ok".into());
+    } else if !verify.signature.is_empty() || !verify.pubkey.is_empty() {
+        // 只给一半 = 配置错误，按拒绝处理（避免「以为验签了其实没验」）
+        return Err((
+            4,
+            "验签参数不完整（signature 与 signer 必须同时提供）".into(),
+        ));
+    }
+
+    Ok(logs)
+}
+
+fn hex_lower(b: &[u8]) -> String {
+    let mut s = String::with_capacity(b.len() * 2);
+    for &x in b {
+        s.push_str(&format!("{:02x}", x));
+    }
+    s
+}
+
+fn hex_decode(s: &str) -> Option<Vec<u8>> {
+    crate::sha256::hex_decode(s)
 }
 
 /// 从 URL 或包名提取合法扩展名（纯字母数字、≤6 字符；拒绝查询串等噪声）。
@@ -267,7 +369,59 @@ mod tests {
 
     #[test]
     fn missing_url_fails_fast() {
-        let o = handle_sw_install("", "macos", "x");
+        let v = PkgVerify { sha256: "", signature: "", pubkey: "" };
+        let o = handle_sw_install("", "macos", "x", &v);
         assert_eq!(o.state, "failed");
+    }
+
+    #[test]
+    fn verify_params_must_be_paired() {
+        // 只给签名不给公钥 = 配置错误，必须拒绝（不能当成「无需验签」）
+        let v = PkgVerify { sha256: "", signature: "aa", pubkey: "" };
+        assert!(verify_package(b"whatever", &v).is_err());
+        let v2 = PkgVerify { sha256: "", signature: "", pubkey: "bb" };
+        assert!(verify_package(b"whatever", &v2).is_err());
+    }
+
+    #[test]
+    fn verify_package_signature_flow() {
+        // 与 Go crypto/ed25519 同语义：对「32 字节摘要原文」签名
+        let seed = crate::sha256::hex_decode("79756475616e2d656432353531392d63726f7373636865636b2d736565642d33").unwrap();
+        let pk = crate::ed25519::public_key(&seed).unwrap();
+        let pkg = b"yuduan-installer-payload-v1";
+        let digest = sha256(pkg);
+        let sig = crate::ed25519::sign(&seed, &digest).unwrap();
+        let sig_hex = hex_lower(&sig);
+        let pk_hex = hex_lower(&pk);
+        let want_sha = hex_lower(&digest);
+
+        // 1) 完整校验通过
+        let v = PkgVerify { sha256: &want_sha, signature: &sig_hex, pubkey: &pk_hex };
+        let logs = verify_package(pkg, &v).expect("正确签名应通过");
+        assert!(logs.iter().any(|l| l == "ed25519 signature ok"));
+
+        // 2) 包被篡改 → 拒（exit 3）
+        let v = PkgVerify { sha256: &want_sha, signature: &sig_hex, pubkey: &pk_hex };
+        let (code, why) = verify_package(b"yuduan-installer-payload-v2", &v).unwrap_err();
+        assert_eq!(code, 3);
+        assert!(why.contains("sha256 mismatch"));
+
+        // 3) 哈希相符但签名是别的内容 → 拒（exit 4）
+        let bad_sig = crate::ed25519::sign(&seed, b"other-message").unwrap();
+        let v = PkgVerify { sha256: &want_sha, signature: &hex_lower(&bad_sig), pubkey: &pk_hex };
+        let (code, why) = verify_package(pkg, &v).unwrap_err();
+        assert_eq!(code, 4);
+        assert!(why.contains("验签失败"));
+
+        // 4) 错误公钥 → 拒（exit 4）
+        let other_seed = crate::sha256::hex_decode("1111111111111111111111111111111111111111111111111111111111111111").unwrap();
+        let other_pk = crate::ed25519::public_key(&other_seed).unwrap();
+        let v = PkgVerify { sha256: &want_sha, signature: &sig_hex, pubkey: &hex_lower(&other_pk) };
+        let (code, _) = verify_package(pkg, &v).unwrap_err();
+        assert_eq!(code, 4);
+
+        // 5) 无校验参数 = 放行（兼容旧中枢，仅记录哈希）
+        let v = PkgVerify { sha256: "", signature: "", pubkey: "" };
+        assert!(verify_package(pkg, &v).is_ok());
     }
 }

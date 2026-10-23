@@ -102,9 +102,50 @@
 
 ### 8.2 M5 软件分发通道
 
-- 仓库：`POST /api/v1/software`（multipart 上传）→ 落盘 `data/repo/<id>` + 内存目录。
+- 仓库：`POST /api/v1/software`（multipart 上传）→ 落盘 `data/repo/<id>` + 内存目录；**上传即计算 SHA-256 并在配置 `YUDUAN_SIGN_SEED` 时用 Ed25519 对「32 字节摘要」签名**，校验参数随目录项持久（`sha256`/`signature`/`signer`）。
 - 下载：`GET /api/v1/repo/<id>`（Agent 经 HTTP 拉取，LAN 内）。
-- 下发：`POST /api/v1/devices/:id/push {software_id}`（便捷）或 `POST /api/v1/devices/:id/commands {action:"sw_install", software_url, platform, pkg_name}`。
-- Agent 侧：下载 → 按扩展名静默安装（`.pkg`→`installer -target /`；`.zip`→解包；`.msi/.exe`→Windows 静默；`.deb/.rpm`→Linux）→ 回报 `result`。
+- 下发：`POST /api/v1/devices/:id/commands {action:"sw_install", software_url, platform, pkg_name, sha256, signature, signer}`。
+  中枢在 `software_url` 指向本仓库（`/api/v1/repo/<id>`）时，**自动解析仓库项并附加校验参数**；外部 URL 不附加。
+- Agent 侧（Rust 生产副端）：下载 → **先 SHA-256 比对、再 Ed25519 验签**（签名为「对 32 字节摘要」的签名，受信公钥优先取 payload `signer`、缺省回退 `YUDUAN_SW_PUBKEY`）→ 校验通过才按扩展名静默安装（`.pkg`→`installer -target /`；`.zip`→解包；`.msi/.exe`→Windows 静默；`.deb/.rpm`→Linux）→ 回报 `result`。
+  - 哈希不符 `exit_code=3`、验签失败 `exit_code=4`，均拒绝安装；**只给一半校验参数视为配置错误、同样拒绝**（避免「以为验签了其实没验」）。
+  - 未配置校验参数（旧中枢/外部 URL）= 仅记录哈希、放行（兼容态）。
 - 编码：画面帧当前为 JPEG base64（清晰、零依赖）；生产演进为 H.264/H.265 二进制帧（见 §4）。
+
+### 8.3 生产化远控（P2P 直连 + 二进制帧 + 编码器协商 + 原生编码器 ABI）
+
+> M4 MVP（§8.1）采用「中枢居中中继 + JPEG base64 文本帧」。本节能演进为 §4 规划的生产目标：
+> **二进制帧 + 编解码器协商 + P2P 直连媒体通道（中继兜底）+ 原生编码器（H.264/H.265/VP8/VP9/AV1）**。
+> 既有 JSON 中继路径保留为 P2P 不可达时的兜底，二者并存、不互斥。
+
+#### 8.3.1 二进制帧（固定头 + payload）
+
+```
+[ magic:u32 'YDYF' ][ version:u8=1 ][ stream:u8 ][ codec:u8 ][ flags:u8 ]
+[ seq:u32 ][ width:u16 ][ height:u16 ][ pts_ms:u32 ][ len:u32 ][ payload:bytes[len] ]
+```
+- `stream`：0 屏幕 / 1 输入回显 / 2 音频。
+- `codec`：`0=RAW_RGBA 1=JPEG 2=H264 3=H265 4=VP8 5=VP9 6=AV1`。
+- `flags`：bit0=I 帧 / bit1=黑屏 / bit2=水印。
+- 小端；头固定 24 字节；payload 零拷贝切片。对应实现 `rust/agent/src/rc_media.rs`（`encode_frame`/`decode_frame`）。
+
+#### 8.3.2 编解码器协商
+
+1. 被控端在 `rc_ready` 后发 `rc_capabilities`（JSON）：`{codecs, max_w, max_h, fps}`，codecs 为可产出编解码器 ID。
+   - 纯 Rust 回退恒宣告 `RAW_RGBA(0)` + `JPEG(1)`；配置 `YUDUAN_ENCODER_LIB` 时追加原生编解码器（2–6）。
+2. 主端回 `rc_select`：`{codec, transport, media_addr?}`。协商规则：主端偏好列表**有序**，取第一个被控端也支持的编解码器（`negotiate()`），无交集则维持中继 + JPEG。
+3. `transport`：`p2p` 直连 / `relay` 中枢中继。
+
+#### 8.3.3 P2P 直连信令与媒体通道
+
+- 信令：`rc_offer`（主端候选地址 `candidates:["ip:port"]`）→ 中枢中继 → 被控端；`rc_answer`（被控端候选）→ 主端；`rc_candidate` 双向增量追加（ICE-lite 风格）。
+- 媒体：双方尝试 `dial_direct(media_addr)` 建立 TCP（3s 超时）；**直连失败则回退中枢中继**（既有 JSON `rc_frame` / 二进制帧经中继亦可）。直连媒体流按「4 字节小端长度前缀 + 帧体」切分（`send_frame`/`recv_frame`），对端 `decode_frame` 还原。
+- 中枢仅做信令/媒体中继，不解密帧内容；局域网不出公网（铁律 1）。
+
+#### 8.3.4 原生编码器 C-ABI（H.264/H.265/VP8/VP9/AV1）
+
+- 纯 Rust 不内置复杂编码器；由部署期动态库（`.so`/`.dylib`/`.dll`）提供，经系统 libc `dlopen`/`LoadLibrary` 加载（与 rc.rs 链接系统框架一致，零第三方 crate）。
+- 约定符号：`yuduan_enc_create(codec, w, h)` / `yuduan_enc_encode(h, rgba, len, out, cap)→written` / `yuduan_enc_destroy(h)`。
+- 环境变量 `YUDUAN_ENCODER_LIB` 指向该库；缺失或加载失败时 `make_encoder()` **自动回退** `RAW_RGBA`/`JPEG`，二进制帧通道不中断。
+- 编码器协商命中原生编解码器即走原生库；否则回退（仅带宽略高，功能不受影响）。
+
 

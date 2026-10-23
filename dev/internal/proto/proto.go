@@ -42,6 +42,13 @@ const (
 	TypeRCStop    = "rc_stop"    // 任一端→对端：结束会话
 	TypeRCEvent   = "rc_event"   // Agent→Hub→Viewer：合规提示/员工确认事件
 
+	// —— 生产化（§8.3）：P2P 直连信令 + 编解码器协商 ——
+	TypeRCCapabilities = "rc_capabilities" // Agent→Hub→Viewer：被控端媒体能力（编解码器/分辨率/帧率）
+	TypeRCSelect       = "rc_select"       // Viewer→Hub→Agent：主端选定的编解码器
+	TypeRCOffer        = "rc_offer"        // Viewer→Hub→Agent：P2P 连接提议（含候选地址）
+	TypeRCAnswer       = "rc_answer"       // Agent→Hub→Viewer：P2P 连接应答（含候选地址）
+	TypeRCCandidate    = "rc_candidate"    // 双向：追加 ICE-lite 候选地址
+
 	// —— M5 软件分发 ——
 	// sw_install 复用 TypeCommand(action="sw_install")，载荷见 CommandPayload 扩展字段
 )
@@ -77,12 +84,18 @@ type HeartbeatPayload struct {
 
 // CommandPayload —— Hub→Agent 的指令（shell / collect / sw_install）。
 type CommandPayload struct {
-	Action     string `json:"action"` // shell / collect / sw_install
-	TaskID     string `json:"task_id"`
-	Command    string `json:"command,omitempty"`
+	Action      string `json:"action"` // shell / collect / sw_install
+	TaskID      string `json:"task_id"`
+	Command     string `json:"command,omitempty"`
 	SoftwareURL string `json:"software_url,omitempty"` // sw_install：下载地址
-	Platform   string `json:"platform,omitempty"`     // sw_install：目标平台 windows/macos/linux
-	PkgName    string `json:"pkg_name,omitempty"`     // sw_install：包名/文件名
+	Platform    string `json:"platform,omitempty"`     // sw_install：目标平台 windows/macos/linux
+	PkgName     string `json:"pkg_name,omitempty"`     // sw_install：包名/文件名
+	// 生产化安全字段（M5 加固）：安装包校验参数。
+	// 副端据此先做 SHA-256 比对、再做 Ed25519 验签（签名为「对 32 字节摘要」的签名）。
+	// 任一字段为空 = 跳过对应校验（兼容旧中枢/外部 URL），但「只给一半」会被副端拒绝。
+	Sha256    string `json:"sha256,omitempty"`
+	Signature string `json:"signature,omitempty"`
+	Signer    string `json:"signer,omitempty"`
 }
 
 // —— M4 远程控制载荷 ——
@@ -131,6 +144,43 @@ type RCEventPayload struct {
 	Consented      bool   `json:"consented,omitempty"`
 }
 
+// —— 生产化（§8.3）：P2P 直连信令 + 编解码器协商载荷 ——
+
+// RCCapabilitiesPayload —— 被控端媒体能力宣告。Codecs 为编解码器 ID 列表（见 rc_media CODEC_*）。
+type RCCapabilitiesPayload struct {
+	SessionID string `json:"session_id"`
+	Codecs    []int  `json:"codecs"`
+	MaxW      int    `json:"max_w"`
+	MaxH      int    `json:"max_h"`
+	Fps       int    `json:"fps"`
+}
+
+// RCSelectPayload —— 主端选定的编解码器（协商结果）。Codec 为 CODEC_* 之一。
+type RCSelectPayload struct {
+	SessionID string `json:"session_id"`
+	Codec     int    `json:"codec"`
+	Transport string `json:"transport"` // "p2p" 直连 / "relay" 中枢中继
+	MediaAddr string `json:"media_addr,omitempty"` // P2P 直连地址（transport=p2p 时）
+}
+
+// RCOfferPayload —— P2P 连接提议：主端收集到的候选地址（局域网 IP:端口）。
+type RCOfferPayload struct {
+	SessionID  string   `json:"session_id"`
+	Candidates []string `json:"candidates"` // 如 ["192.168.1.10:19001"]
+}
+
+// RCAnswerPayload —— 被控端应答：其候选地址。
+type RCAnswerPayload struct {
+	SessionID  string   `json:"session_id"`
+	Candidates []string `json:"candidates"`
+}
+
+// RCCandidatePayload —— 追加候选地址（ICE-lite 风格，逐个增量上报）。
+type RCCandidatePayload struct {
+	SessionID string   `json:"session_id"`
+	Candidate string   `json:"candidate"`
+}
+
 // —— M5 软件分发载荷 ——
 
 // SoftwareItem 软件仓库目录项（与 hub 内存目录对应）。
@@ -142,6 +192,11 @@ type SoftwareItem struct {
 	FileName   string `json:"file_name"`
 	Size       int64  `json:"size"`
 	UploadedAt int64  `json:"uploaded_at"`
+	// 生产化安全字段（M5 加固）：文件 SHA-256、Ed25519 签名（对 32 字节摘要）、签名公钥（hex）。
+	// 上传时由中枢计算并签名，随 sw_install 指令下发给副端做安装前校验。
+	Sha256    string `json:"sha256,omitempty"`
+	Signature string `json:"signature,omitempty"`
+	Signer    string `json:"signer,omitempty"`
 }
 
 // ResultPayload —— Agent→Hub 的执行结果。

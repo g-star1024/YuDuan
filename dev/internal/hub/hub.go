@@ -7,6 +7,7 @@ package hub
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -18,6 +19,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"crypto/ed25519"
 
 	"yuduan/internal/audit"
 	"yuduan/internal/auth"
@@ -50,6 +53,7 @@ type HubConfig struct {
 	DirSync     *directory.SyncEngine
 	HubID       string // 多中枢部署时的节点标识（缺省 hub-<hostname>）
 	PublicAddr  string // 节点对外地址（/api/v1/hubs 展示用）
+	SignSeed    []byte // Ed25519 32 字节种子（YUDUAN_SIGN_SEED）；为空 = 软件包不签名（仅记哈希）
 }
 
 // Hub 是中枢核心结构。
@@ -72,6 +76,9 @@ type Hub struct {
 	hubID      string
 	publicAddr string
 	bus        *CommandBus // 非 nil 时指令走多中枢总线（去粘性）
+
+	signSeed []byte // Ed25519 种子（可能为空）
+	signPub  string // 由 signSeed 派生的公钥 hex（可能为空）
 }
 
 // NewHub 构造中枢，缺省回退到内存实现。
@@ -97,7 +104,7 @@ func NewHub(cfg HubConfig) *Hub {
 		host, _ := os.Hostname()
 		hubID = "hub-" + host
 	}
-	return &Hub{
+	h := &Hub{
 		store:      cfg.Store,
 		auditor:    cfg.Auditor,
 		users:      cfg.Users,
@@ -112,6 +119,17 @@ func NewHub(cfg HubConfig) *Hub {
 		repoDir:    cfg.RepoDir,
 		hubID:      hubID,
 		publicAddr: cfg.PublicAddr,
+		signSeed:   cfg.SignSeed,
+	}
+	h.initSigning()
+	return h
+}
+
+// initSigning 派生签名公钥（供软件包签名与下发校验参数使用）。
+func (h *Hub) initSigning() {
+	if len(h.signSeed) == ed25519.SeedSize {
+		priv := ed25519.NewKeyFromSeed(h.signSeed)
+		h.signPub = hex.EncodeToString(priv.Public().(ed25519.PublicKey))
 	}
 }
 
@@ -399,7 +417,7 @@ func (h *Hub) handleAgentWS(w http.ResponseWriter, r *http.Request) {
 			}
 			log.Printf("[hub] result task=%s state=%s exit=%d", p.TaskID, p.State, p.ExitCode)
 
-		case proto.TypeRCReady, proto.TypeRCFrame, proto.TypeRCEvent:
+		case proto.TypeRCReady, proto.TypeRCFrame, proto.TypeRCEvent, proto.TypeRCCapabilities, proto.TypeRCAnswer, proto.TypeRCCandidate:
 			h.relayToViewer(deviceID, raw)
 		case proto.TypeRCStop:
 			h.endSession(deviceID)
@@ -483,7 +501,7 @@ func (h *Hub) handleViewerWS(w http.ResponseWriter, r *http.Request) {
 			h.audit(p.Operator, "rc_start", p.DeviceID, "远控会话开启", "success")
 			log.Printf("[hub] rc session start device=%s operator=%s", p.DeviceID, p.Operator)
 
-		case proto.TypeRCInput, proto.TypeRCStop:
+		case proto.TypeRCInput, proto.TypeRCStop, proto.TypeRCSelect, proto.TypeRCOffer, proto.TypeRCCandidate:
 			h.mu.Lock()
 			agentConn, ok := h.conns[deviceID]
 			h.mu.Unlock()
@@ -537,18 +555,34 @@ func (h *Hub) handleDeviceCmd(w http.ResponseWriter, r *http.Request, claims cry
 		SoftwareURL string `json:"software_url"`
 		Platform    string `json:"platform"`
 		PkgName     string `json:"pkg_name"`
+		Sha256      string `json:"sha256"`
+		Signature   string `json:"signature"`
+		Signer      string `json:"signer"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&body)
 
 	timeout := 15 * time.Second
 	if body.Action == "sw_install" {
 		timeout = 120 * time.Second
+		// 生产化：若 software_url 指向本仓库（/api/v1/repo/{id}），自动附加
+		// 中枢签发的校验参数，使副端能做哈希比对 + Ed25519 验签；外部 URL 不附加。
+		if repoID := repoIDFromURL(body.SoftwareURL); repoID != "" {
+			h.mu.Lock()
+			it, ok := h.software[repoID]
+			h.mu.Unlock()
+			if ok {
+				body.Sha256 = it.Sha256
+				body.Signature = it.Signature
+				body.Signer = it.Signer
+			}
+		}
 	}
 
 	taskID := newTaskID()
 	cmd, _ := proto.NewEnvelope(proto.TypeCommand, 0, proto.CommandPayload{
 		Action: body.Action, TaskID: taskID, Command: body.Command,
 		SoftwareURL: body.SoftwareURL, Platform: body.Platform, PkgName: body.PkgName,
+		Sha256: body.Sha256, Signature: body.Signature, Signer: body.Signer,
 	})
 	h.sign(&cmd) // 安全基座：关键指令 HMAC 签名
 	cmdBytes, _ := json.Marshal(cmd)
@@ -688,15 +722,27 @@ func (h *Hub) handleSoftwareUpload(w http.ResponseWriter, r *http.Request, claim
 		writeErr(w, 3004, "save failed: "+err.Error())
 		return
 	}
+	// 生产化：落盘后回读计算 SHA-256 并（若配置种子）做 Ed25519 签名，随项持久于内存目录。
+	data, rerr := os.ReadFile(dst)
+	if rerr != nil {
+		writeErr(w, 3005, "read-back failed: "+rerr.Error())
+		return
+	}
+	shaHex, sigHex, signer := h.signSoftware(data)
 	item := &proto.SoftwareItem{
 		ID: id, Name: name, Version: version, Platform: platform,
 		FileName: header.Filename, Size: size, UploadedAt: time.Now().Unix(),
+		Sha256: shaHex, Signature: sigHex, Signer: signer,
 	}
 	h.mu.Lock()
 	h.software[id] = item
 	h.mu.Unlock()
-	h.audit(claims.Username, "software_upload", id, "name="+name+" v"+version, "success")
-	log.Printf("[hub] software uploaded: %s v%s (%s) %d bytes", name, version, platform, size)
+	if sigHex != "" {
+		log.Printf("[hub] software uploaded & signed: %s v%s (%s) %d bytes sha256=%s signer=%s", name, version, platform, size, shaHex[:16], signer[:16])
+	} else {
+		log.Printf("[hub] software uploaded (unsigned): %s v%s (%s) %d bytes sha256=%s", name, version, platform, size, shaHex[:16])
+	}
+	h.audit(claims.Username, "software_upload", id, "name="+name+" v"+version+" sha256="+shaHex, "success")
 	writeJSON(w, map[string]any{"code": 0, "item": item})
 }
 
@@ -783,6 +829,20 @@ func (h *Hub) sign(env *proto.Envelope) {
 	env.Sig = crypto.SignCommand(h.secret, env.MsgID, env.Ts, env.Seq, string(env.Payload), env.Nonce)
 }
 
+// signSoftware 计算文件 SHA-256，并在配置 Ed25519 种子时对「32 字节摘要」签名，
+// 返回 (sha256Hex, signatureHex, signerPubHex)。未配置种子时仅返回哈希（不签名）。
+// 与副端 Rust ed25519::sign(seed, digest) 同语义：签名消息即 32 字节摘要本身。
+func (h *Hub) signSoftware(data []byte) (string, string, string) {
+	sum := sha256.Sum256(data)
+	shaHex := hex.EncodeToString(sum[:])
+	if len(h.signSeed) == ed25519.SeedSize {
+		priv := ed25519.NewKeyFromSeed(h.signSeed)
+		sig := ed25519.Sign(priv, sum[:]) // 对 32 字节摘要签名（Rust 副端同样以 digest 为消息验签）
+		return shaHex, hex.EncodeToString(sig), hex.EncodeToString(priv.Public().(ed25519.PublicKey))
+	}
+	return shaHex, "", ""
+}
+
 // ---- helpers ----
 
 func deviceIDFromPath(path string) string {
@@ -792,6 +852,21 @@ func deviceIDFromPath(path string) string {
 		return ""
 	}
 	return parts[0]
+}
+
+// repoIDFromURL 从软件下载 URL 解析仓库项 ID（/api/v1/repo/{id}）。
+// 仅当 URL 指向本中枢仓库时才返回 id，外部 URL 返回空（不附加校验参数）。
+func repoIDFromURL(url string) string {
+	const prefix = "/api/v1/repo/"
+	idx := strings.Index(url, prefix)
+	if idx < 0 {
+		return ""
+	}
+	rest := url[idx+len(prefix):]
+	if i := strings.IndexAny(rest, "/?#"); i >= 0 {
+		rest = rest[:i]
+	}
+	return strings.TrimSpace(rest)
 }
 
 func writeJSON(w http.ResponseWriter, v any) {

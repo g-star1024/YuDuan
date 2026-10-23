@@ -15,9 +15,16 @@
 //   ws://  直连 TCP（明文，仅限受信局域网/开发调试）
 //   wss:// 经 openssl s_client 子进程管道代理做 TLS（std 无 TLS；见 WsClient::connect）
 // 环境变量：
-//   YUDUAN_HUB          中枢地址，默认 ws://127.0.0.1:8080/ws/agent（支持 wss://）
-//   YUDUAN_HMAC_SECRET  指令验签密钥；为空 = 开发态放行（与 Go 中枢 YUDUAN_HMAC_SECRET 一致才启用）
-//   YUDUAN_TLS_CAFILE   可选：wss 证书校验 CA（设置后启用严格校验；缺省接受自签名，限局域网）
+//   YUDUAN_HUB              中枢地址，默认 ws://127.0.0.1:8080/ws/agent（支持 wss://）
+//   YUDUAN_HMAC_SECRET      指令验签密钥；为空 = 开发态放行（与 Go 中枢 YUDUAN_HMAC_SECRET 一致才启用）
+//   YUDUAN_TLS_CAFILE       可选：wss 证书校验 CA（设置后启用严格校验；缺省接受自签名，限局域网）
+//   YUDUAN_TLS_PIN          可选：wss 服务端证书 SPKI SHA-256 公钥固定（RFC 7469）；
+//                             设置后仅信任该证书，不匹配则拒绝连接（生产推荐）
+//   YUDUAN_CLIENT_CERT/KEY  可选：wss mTLS 客户端证书/私钥（PEM），用于中枢开启 mTLS 时鉴身
+//   YUDUAN_SW_PUBKEY       可选：软件包验签受信公钥（hex）；缺省回退指令 payload 中的 signer
+//   YUDUAN_AGENT_EXPECTED_SHA256  可选：副端自校验期望值；配合 YUDUAN_AGENT_ENFORCE_TAMPER=1 阻断篡改
+//   YUDUAN_AGENT_ENFORCE_TAMPER   可选：1=防篡改关键失败阻断启动
+//   YUDUAN_AGENT_ANTI_DEBUG       可选：1=启用反调试检测
 //
 // 控制面协议：JSON 信封（payload 为内嵌对象）——见 dev/proto/protocol.md 与 dev/internal/proto/proto.go。
 
@@ -28,11 +35,15 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+mod ed25519;
 mod httpget;
 mod rc;
+mod rc_media;
 mod secure;
 mod sha256;
 mod swdist;
+mod tamper;
+mod tls;
 
 // ===================== 极简 JSON 解析（无 serde，纯 std） =====================
 
@@ -701,6 +712,9 @@ struct WsClient {
     writer: WsWriter,
     /// wss 模式下保活 openssl 子进程；WsClient  drop（会话结束/重连）时 kill，避免残留管道进程。
     tls_child: Option<Child>,
+    /// pin 模式下临时 CAfile 路径；Drop 时删除，确保 openssl 子进程整个生命周期内文件存在
+    /// （openssl 以 -CAfile 路径自行 fopen 读取，删除时机早于子进程读取会导致握手失败 / TOCTOU）。
+    pin_ca: Option<String>,
 }
 
 impl Drop for WsClient {
@@ -708,6 +722,9 @@ impl Drop for WsClient {
         if let Some(c) = &mut self.tls_child {
             let _ = c.kill();
             let _ = c.wait();
+        }
+        if let Some(p) = &self.pin_ca {
+            let _ = std::fs::remove_file(p);
         }
     }
 }
@@ -748,8 +765,34 @@ impl WsClient {
 
         // 传输层：ws:// 直连 TCP；wss:// 以 openssl s_client 子进程做 TLS 管道代理。
         // （std 无 TLS 实现；openssl 为系统常驻二进制，符合零第三方依赖约束。）
+        // pin 模式临时 CAfile 路径：声明在 if/else 之外，连接成功后存入 WsClient，在 Drop 中删除。
+        let mut pinned_ca: Option<String> = None;
         let (reader_box, mut writer_box, child): (Box<dyn Read + Send>, Box<dyn Write + Send>, Option<Child>) =
             if is_tls {
+                // 证书固定（RFC 7469 SPKI 指纹）：YUDUAN_TLS_PIN 设置时，抓取并校验服务端证书，
+                // 校验通过则把该证书作为临时 CAfile 供数据隧道严格信任（pin = 仅信任此证书，避免 TOCTOU）。
+                if let Ok(pin) = std::env::var("YUDUAN_TLS_PIN") {
+                    if !pin.trim().is_empty() {
+                        match crate::tls::verify_server_pin(&addr, &sni_host, &pin) {
+                            Some(pem) => match crate::tls::write_temp_ca(&pem) {
+                                Some(p) => pinned_ca = Some(p),
+                                None => {
+                                    return Err(std::io::Error::new(
+                                        std::io::ErrorKind::Other,
+                                        "TLS 证书固定：无法写入临时 CA 文件",
+                                    ))
+                                }
+                            },
+                            None => {
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::PermissionDenied,
+                                    "TLS 证书固定校验失败：SPKI 不匹配或服务端证书不可达",
+                                ))
+                            }
+                        }
+                    }
+                }
+
                 let mut cmd = Command::new("openssl");
                 cmd.arg("s_client")
                     .arg("-connect")
@@ -758,10 +801,24 @@ impl WsClient {
                     .arg(&sni_host)
                     .arg("-quiet")
                     .arg("-ign_eof"); // stdin EOF 不自动断开，由本进程生命周期管理
-                // 配置了 CA 才做严格校验；缺省接受自签名（仅限受信局域网，生产应配置 CA 并固定证书）
-                if let Ok(cafile) = std::env::var("YUDUAN_TLS_CAFILE") {
+                // 优先使用固定证书（临时 CAfile）；其次若配置了 CA 文件则严格校验；
+                // 二者皆无 = 缺省接受自签名（仅限受信局域网，生产应配置 CA 或固定指纹）。
+                if let Some(ca) = &pinned_ca {
+                    cmd.arg("-CAfile").arg(ca).arg("-verify_return_error");
+                } else if let Ok(cafile) = std::env::var("YUDUAN_TLS_CAFILE") {
                     if !cafile.is_empty() {
                         cmd.arg("-CAfile").arg(&cafile).arg("-verify_return_error");
+                    }
+                }
+                // mTLS 客户端证书（YUDUAN_CLIENT_CERT / YUDUAN_CLIENT_KEY）
+                if let Ok(cert) = std::env::var("YUDUAN_CLIENT_CERT") {
+                    if !cert.is_empty() {
+                        cmd.arg("-cert").arg(&cert);
+                    }
+                }
+                if let Ok(key) = std::env::var("YUDUAN_CLIENT_KEY") {
+                    if !key.is_empty() {
+                        cmd.arg("-key").arg(&key);
                     }
                 }
                 let mut c = cmd
@@ -775,6 +832,8 @@ impl WsClient {
                             format!("spawn openssl failed: {} (wss 需要系统 openssl)", e),
                         )
                     })?;
+                // 注意：临时 CAfile 不能在 spawn 后立即删除——openssl 以 -CAfile 路径自行 fopen 读取，
+                // 子进程启动后并不会继承该 fd，文件需在子进程整个生命周期内存在；删除交由 WsClient::Drop。
                 let sin = c
                     .stdin
                     .take()
@@ -798,15 +857,27 @@ impl WsClient {
         let handshake = format!(
             "GET {path} HTTP/1.1\r\nHost: {authority}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
         );
-        writer_box.write_all(handshake.as_bytes())?;
-        writer_box.flush()?;
+
+        // 先构造 WsClient（含 tls_child / pin_ca）：握手失败提前 return 时，
+        // WsClient 离开作用域触发 Drop，统一清理 openssl 子进程与临时 CAfile（错误路径也不残留）。
+        let mut ws = WsClient {
+            reader: BufReader::new(reader_box),
+            writer: Arc::new(Mutex::new(writer_box)),
+            tls_child: child,
+            pin_ca: pinned_ca,
+        };
+
+        {
+            let mut w = ws.writer.lock().unwrap();
+            w.write_all(handshake.as_bytes())?;
+            w.flush()?;
+        }
 
         // 读取 101 响应头直至空行
-        let mut reader = BufReader::new(reader_box);
         let mut header = Vec::new();
         let mut byte = [0u8; 1];
         loop {
-            let n = reader.read(&mut byte)?;
+            let n = ws.reader.read(&mut byte)?;
             if n == 0 {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
@@ -826,11 +897,15 @@ impl WsClient {
             ));
         }
 
-        Ok(WsClient {
-            reader,
-            writer: Arc::new(Mutex::new(writer_box)),
-            tls_child: child,
-        })
+        // 握手成功：openssl 子进程的 TLS 握手已在返回隧道数据前完成（已读取 -CAfile），
+        // 此处即可安全删除临时 CAfile；即便后续被 SIGTERM 终止也不会残留（信号安全）。
+        // 置空 pin_ca，Drop 再次删除时为空操作。
+        if let Some(ca) = &ws.pin_ca {
+            let _ = std::fs::remove_file(ca);
+            ws.pin_ca = None;
+        }
+
+        Ok(ws)
     }
 
     // 发送掩码文本帧（客户端必须加掩码）
@@ -953,11 +1028,19 @@ fn handle_command(
             "shell" => run_shell(&command),
             "collect" => run_collect(),
             "sw_install" => {
-                // M5 软件分发：下载安装包并按平台静默安装（swdist.rs）
+                // M5 软件分发：下载安装包 → 哈希/签名校验 → 按平台静默安装（swdist.rs）
                 let url = payload.get("software_url").and_then(|v| v.as_str()).unwrap_or("");
                 let platform = payload.get("platform").and_then(|v| v.as_str()).unwrap_or("");
                 let pkg = payload.get("pkg_name").and_then(|v| v.as_str()).unwrap_or("");
-                let o = swdist::handle_sw_install(url, platform, pkg);
+                // 验签参数：payload 优先，缺省回退到 YUDUAN_SW_PUBKEY（受信签名公钥）
+                let env_pk = std::env::var("YUDUAN_SW_PUBKEY").unwrap_or_default();
+                let pk_field = payload.get("signer").and_then(|v| v.as_str()).unwrap_or("");
+                let v = swdist::PkgVerify {
+                    sha256: payload.get("sha256").and_then(|v| v.as_str()).unwrap_or(""),
+                    signature: payload.get("signature").and_then(|v| v.as_str()).unwrap_or(""),
+                    pubkey: if pk_field.is_empty() { &env_pk } else { pk_field },
+                };
+                let o = swdist::handle_sw_install(url, platform, pkg, &v);
                 (o.state, o.exit_code, o.output_log)
             }
             other => (
@@ -1264,6 +1347,17 @@ fn session(url: &str) -> std::io::Result<()> {
 }
 
 fn main() {
+    // 生产化加固：启动前防篡改自检（自校验 + 反调试 + 代码签名）。
+    let reports = tamper::self_check();
+    let (blocked, summary) = tamper::summarize(&reports);
+    eprintln!("[agent] 防篡改自检：\n{}", summary);
+    if blocked && tamper::enforce() {
+        eprintln!(
+            "[agent] 防篡改自检未通过且已启用强制阻断（YUDUAN_AGENT_ENFORCE_TAMPER=1），退出。",
+        );
+        std::process::exit(2);
+    }
+
     let url = std::env::var("YUDUAN_HUB").unwrap_or_else(|_| "ws://127.0.0.1:8080/ws/agent".to_string());
     eprintln!("[agent] 御端 Rust 副端启动，目标中枢: {}", url);
     eprintln!(
