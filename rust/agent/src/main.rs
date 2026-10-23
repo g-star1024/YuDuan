@@ -1393,6 +1393,12 @@ fn session(url: &str) -> std::io::Result<()> {
                             rc::handle_rc_qos(p);
                         }
                     }
+                    // §8.3.11 传输级自适应：主端 RTT 探测，副端原样回显 t0
+                    "rc_ping" => {
+                        if let Some(p) = env.get("payload") {
+                            rc::handle_rc_ping(&ws.writer.clone(), &rng, &seq, p);
+                        }
+                    }
                     _ => {
                         // 其它类型优雅忽略，不崩溃
                         eprintln!("[agent] 忽略未知/不相关消息类型: {}", msg_type);

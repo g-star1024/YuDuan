@@ -49,6 +49,7 @@ func main() {
 	timeout := flag.Duration("timeout", 25*time.Second, "总体超时")
 	candidates := flag.Bool("candidates", true, "p2p 时广播本机候选地址（ICE-lite：被控端逐个尝试直连）")
 	qos := flag.Int("qos", 0, "协商后每 2s 向被控端发送 rc_qos 目标帧率（0=关闭；验证 §8.3.9 带宽自适应闭环）")
+	probe := flag.Bool("probe", false, "每 1s 发 rc_ping 探测 RTT（§8.3.11），并按 RTT 档位向被控端反馈帧率上限")
 	flag.Parse()
 	if *device == "" {
 		fatal("需指定 -device（被控设备 ID）")
@@ -146,6 +147,7 @@ func main() {
 	got, totalBytes := 0, 0
 	selectSent := false
 	codecAdopted := false
+	lastQosByRtt := time.Time{} // §8.3.11：上次按 RTT 反馈的时刻（节流 2s）
 
 	for got < *frames {
 		remaining := time.Until(deadline)
@@ -208,7 +210,50 @@ func main() {
 						}
 					}()
 				}
+				// §8.3.11 传输级自适应：周期 RTT 探测；RTT>80ms 时按档位反馈帧率上限，
+				// 让被控端在不依赖渲染统计的情况下感知网络拥塞。
+				if *probe {
+					go func() {
+						for {
+							time.Sleep(1 * time.Second)
+							p, err := proto.NewEnvelope(proto.TypeRCPing, 0, proto.RCPingPayload{
+								SessionID: sessionID, T0: time.Now().UnixMilli(),
+							})
+							if err != nil {
+								return
+							}
+							pB, _ := json.Marshal(p)
+							if err := conn.WriteMessage(pB); err != nil {
+								return
+							}
+						}
+					}()
 				}
+				}
+		case proto.TypeRCPong:
+			var p proto.RCPingPayload
+			_ = env.DecodePayload(&p)
+			rtt := time.Now().UnixMilli() - p.T0
+			logf("RTT 探测: %d ms", rtt)
+			// RTT 越过档位（>80ms）→ 立即反馈一次上限（副端 min(目标, 档位) 生效）
+			if *probe && rtt > 80 && time.Since(lastQosByRtt) > 2*time.Second {
+				cap := 15
+				if rtt > 400 {
+					cap = 4
+				} else if rtt > 200 {
+					cap = 8
+				}
+				q, err := proto.NewEnvelope(proto.TypeRCQos, 0, proto.RCQosPayload{
+					SessionID: sessionID, FPS: cap, Reason: "rtt_probe", RTTMs: rtt,
+				})
+				if err == nil {
+					qB, _ := json.Marshal(q)
+					if err := conn.WriteMessage(qB); err == nil {
+						logf("已发送 rc_qos（RTT %dms → 上限 %dfps）", rtt, cap)
+						lastQosByRtt = time.Now()
+					}
+				}
+			}
 		case proto.TypeRCEvent:
 			var p proto.RCEventPayload
 			_ = env.DecodePayload(&p)

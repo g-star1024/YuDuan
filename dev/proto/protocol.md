@@ -61,7 +61,7 @@
 2. 中枢向 Agent 下发 `command(remote_control)`，Agent 回 `ack` 并启动采集，远端弹提示。
 3. 主端↔Agent 经中枢交换 `rc_offer/answer/candidate`，LAN 内直连；跨网段由中枢 Relay 中转。
 4. 媒体通道建立 → 画面/输入双向；支持黑屏/锁屏/水印/结束。
-5. 会话结束 → 生成 `sessions` 记录 + 加密录像（留存 ≤90 天自动清理）。
+5. 会话结束 → 生成 `sessions` 记录 + 加密录像（留存 ≤90 天自动清理；实现见 §8.3.12，opt-in）。
 
 ## 6. 错误码
 
@@ -191,7 +191,7 @@
 
 - **其他平台真实编码器**：Linux（VAAPI 或 x264/x265）、Windows（Media Foundation）按 §8.3.4 契约供给动态库即可（macOS VideoToolbox 已落地，见 §8.3.6 / §8.3.8）。
 - **Linux/Windows 实跑**：采集（X11/GDI）与输入注入（XTest/SendInput）分支已写，需对应机器实测；本机（macOS）已全量验证。
- - **带宽自适应**：✅ 主端反馈闭环已落地（§8.3.9，rc_qos）。仍缺网络层 RTT/丢包测量驱动的传输级自适应（需 QoS 探测帧，后续扩展）。
+ - **带宽自适应**：✅ 主端反馈闭环已落地（§8.3.9，rc_qos）；传输级 RTT 档位夹取已落地（§8.3.11，rc_ping/rc_pong）。仍缺丢包率测量与码率动态重参数化（后续扩展）。
  - **JPEG 工具链路径降采样**：✅ 已落地（§8.3.10，内置 JPEG 编码器 + RGBA 采集 + 降采样；CLI 路径保留为兜底）。
  - **录像留存**：§5 加密录像留存策略待产品决策后实现。
 +
@@ -258,3 +258,31 @@
 | 8 帧总带宽（1920×1080 级） | 240,975 B | 222,141 B（含首帧内容帧 210KB；稳态 P 帧 2KB 级） |
 
 - **可复现 fixture**：`dev/encoder-vt/harness.c`（直测 C-ABI，合成渐变+运动方块内容 → 裸流）、`dev/encoder-vt/annexb_stat.py`（Annex-B 切分 + NAL 类型 + ffprobe 交叉验证）、`dev/e2e_vt_encoder.py`（中枢+副端+viewer 全链路，含 ffmpeg 全帧零错误解码校验）。三者均要求：`00 00 00 01` 起始码、无空 NAL、参数集在位、ffmpeg 解码无错、关键帧比例正常。
+
+### 8.3.11 传输级 RTT 自适应（2026-10-24 落地）
+
+媒体路径网络质量探测 + 副端帧率夹取，与 §8.3.9 主端反馈闭环独立生效（两者取 min）：
+
+- **`rc_ping`**（Viewer→Hub→Agent）：`{session_id, t0}`，t0=主端本地毫秒时间戳；主端每 2s 周期发送（rc.html 会话内持续；p2pviewer `-probe` 每 1s）。
+- **`rc_pong`**（Agent→Hub→Viewer）：副端**原样回显** `{session_id, t0}`；主端 RTT = now − t0。跨中继/P2P 通道同语义（应用层探测，不依赖 ICMP）。
+- **`rc_qos.rtt_ms`**：主端把实测 RTT 随 QoS 反馈顺带上报；副端按档位夹帧率上限：
+
+| RTT | 帧率上限 | 说明 |
+|---|---|---|
+| ≤80ms | 不限 | LAN 正常 |
+| ≤200ms | 15fps | 跨网段/轻度拥塞 |
+| ≤400ms | 8fps | 中度拥塞 |
+| >400ms | 4fps | 重度拥塞（保交互性） |
+
+- **副端实现**：`RC_RTT_MS` 原子量，新会话清零（等主端重新探测）；合法区间 0..=60000（越界忽略）；`rc_frame_interval_ms() = min(rc_qos.fps / env / caps, rtt_cap)`。RTT 跨档变化打日志。
+- **主端实现**：rc.html 状态栏显示 `RTT xx ms`；自适应模式下 RTT>250ms 触发立即降档（不等渲染统计）；每次 rc_qos 顺带携带最新 RTT。
+- **尚缺**：丢包率测量（需序列号/到达率统计）与码率动态调整（需编码器运行时重参数化接口），后续扩展。
+
+### 8.3.12 加密录像留存（§5 落地，opt-in）
+
+- **开关**：`YUDUAN_RC_RECORD=1`（默认关）。目录 `YUDUAN_RECORD_DIR`（默认 `data/recordings`，0700）；留存 `YUDUAN_RECORD_RETENTION_DAYS`（默认 90）。
+- **文件格式**（`.yrec`，`internal/record`）：行1 `YDREC01` 魔数；行2 会话元数据 JSON（session/device/operator/started_at/consent——明文，供运维检索审计）；其后逐帧块 `[4B 大端明文长度][12B nonce][AES-256-GCM 密文+16B tag]`，明文即 24B 帧头+payload 的原始媒体帧。
+- **密钥**：主密钥 `YUDUAN_RECORD_KEY`（32B hex）/ `_FILE`（keystore 收口）；未配置时由 HMAC 密钥派生（`sha256("yuduan-record:"+secret)`，开发态兜底——生产必须显式配置独立密钥）。块密钥按会话派生 `sha256(master‖session_id)`。
+- **流程**：中继首帧懒开文件（失败仅记一次日志，不阻断会话）；endSession 落盘 + 审计 `rc_record_saved`；Janitor 每小时按 mtime 清理过期文件。回放 `record.ReadAll(path, master)` 逐帧还原，密钥错误/篡改即 GCM 校验失败。
+- **API**：`GET /api/v1/recordings`（PermAuditView）列出 `{name,bytes,modified}`（不含内容）。
+- **边界**：仅中继（relay）路径录像——P2P 直连帧不经中枢，属设计预期（P2P 模式如需录像须副端/主端本地实现，待产品决策）。

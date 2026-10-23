@@ -27,6 +27,7 @@ import (
 	"yuduan/internal/crypto"
 	"yuduan/internal/directory"
 	"yuduan/internal/proto"
+	"yuduan/internal/record"
 	"yuduan/internal/store"
 	"yuduan/internal/ws"
 )
@@ -39,6 +40,8 @@ type RCSession struct {
 	Viewer    *ws.Conn
 	StartedAt time.Time
 	Consent   bool
+	rec       *record.Writer // 加密录像（启用 YUDUAN_RC_RECORD 后首帧懒开；endSession 落盘）
+	recFailed bool           // 录像文件创建失败标记（本会话不再尝试）
 }
 
 // HubConfig 是中枢的可选配置；缺省项自动回退到内存实现。
@@ -54,6 +57,13 @@ type HubConfig struct {
 	HubID       string // 多中枢部署时的节点标识（缺省 hub-<hostname>）
 	PublicAddr  string // 节点对外地址（/api/v1/hubs 展示用）
 	SignSeed    []byte // Ed25519 32 字节种子（YUDUAN_SIGN_SEED）；为空 = 软件包不签名（仅记哈希）
+
+	// §5 加密录像留存（opt-in）：RecordEnabled 开启后，中继媒体帧逐帧 AES-GCM 落盘，
+	// endSession 关闭文件；Janitor 按 RecordRetentionDays 清理过期录像。
+	RecordEnabled       bool
+	RecordDir           string
+	RecordRetentionDays int
+	RecordKey           []byte // 录像主密钥（nil = 从 HMAC 密钥派生开发态兜底）
 }
 
 // Hub 是中枢核心结构。
@@ -79,6 +89,12 @@ type Hub struct {
 
 	signSeed []byte // Ed25519 种子（可能为空）
 	signPub  string // 由 signSeed 派生的公钥 hex（可能为空）
+
+	recEnabled bool
+	recDir     string
+	recRetention int
+	recKey     []byte
+	stopJanitor func()
 }
 
 // NewHub 构造中枢，缺省回退到内存实现。
@@ -120,6 +136,25 @@ func NewHub(cfg HubConfig) *Hub {
 		hubID:      hubID,
 		publicAddr: cfg.PublicAddr,
 		signSeed:   cfg.SignSeed,
+		recEnabled: cfg.RecordEnabled,
+		recDir:     cfg.RecordDir,
+		recRetention: cfg.RecordRetentionDays,
+		recKey:     cfg.RecordKey,
+	}
+	if h.recEnabled {
+		if h.recDir == "" {
+			h.recDir = "data/recordings"
+		}
+		if h.recRetention <= 0 {
+			h.recRetention = 90
+		}
+		if h.recKey == nil {
+			// 开发态兜底：从 HMAC 密钥派生（keystore.LoadRecordKey 未配置时）。
+			h.recKey = record.DeriveMaster(cfg.HMACSecret)
+		}
+		_ = os.MkdirAll(h.recDir, 0o700)
+		h.stopJanitor = record.StartJanitor(h.recDir, h.recRetention, time.Hour)
+		log.Printf("[hub] 远控录像已启用：dir=%s 留存=%d 天", h.recDir, h.recRetention)
 	}
 	h.initSigning()
 	return h
@@ -158,6 +193,8 @@ func (h *Hub) Handler() http.Handler {
 	mux.HandleFunc("/api/v1/admin/users/", h.guard(auth.PermUserManage, h.handleAdminUserAction))
 	// 受保护：多中枢节点视图（admin）
 	mux.HandleFunc("/api/v1/hubs", h.guard(auth.PermUserManage, h.handleHubs))
+	// 受保护：远控录像列表（§5 加密留存；admin 查阅）
+	mux.HandleFunc("/api/v1/recordings", h.guard(auth.PermAuditView, h.handleRecordings))
 	mux.HandleFunc("/", h.handleConsole)
 	return mux
 }
@@ -422,7 +459,7 @@ func (h *Hub) handleAgentWS(w http.ResponseWriter, r *http.Request) {
 			}
 			log.Printf("[hub] result task=%s state=%s exit=%d", p.TaskID, p.State, p.ExitCode)
 
-		case proto.TypeRCReady, proto.TypeRCFrame, proto.TypeRCEvent, proto.TypeRCCapabilities, proto.TypeRCAnswer, proto.TypeRCCandidate:
+		case proto.TypeRCReady, proto.TypeRCFrame, proto.TypeRCEvent, proto.TypeRCCapabilities, proto.TypeRCAnswer, proto.TypeRCCandidate, proto.TypeRCPong:
 			h.relayToViewer(deviceID, raw, false)
 		case proto.TypeRCStop:
 			h.endSession(deviceID)
@@ -442,6 +479,7 @@ func (h *Hub) handleAgentWS(w http.ResponseWriter, r *http.Request) {
 }
 
 // relayToViewer 将 Agent 消息透传给会话 Viewer；binary=true 时按二进制帧写（媒体帧中继）。
+// 启用录像时，中继的二进制媒体帧同步加密落盘（§5；落盘失败不阻断会话，仅记日志一次）。
 func (h *Hub) relayToViewer(deviceID string, raw []byte, binary bool) {
 	h.mu.Lock()
 	s, ok := h.sessions[deviceID]
@@ -450,10 +488,35 @@ func (h *Hub) relayToViewer(deviceID string, raw []byte, binary bool) {
 		return
 	}
 	if binary {
+		if h.recEnabled {
+			h.recordFrame(s, raw)
+		}
 		_ = s.Viewer.WriteBinary(raw)
 		return
 	}
 	_ = s.Viewer.WriteMessage(raw)
+}
+
+// recordFrame 懒开录像文件并追加一帧；失败仅记一次日志（录像不可用不阻断远控）。
+func (h *Hub) recordFrame(s *RCSession, raw []byte) {
+	if s.rec == nil {
+		if s.recFailed {
+			return
+		}
+		w, err := record.Open(h.recDir, h.recKey, record.Meta{
+			SessionID: s.SessionID, DeviceID: s.DeviceID, Operator: s.Operator,
+			StartedAt: s.StartedAt, Consent: s.Consent,
+		})
+		if err != nil {
+			s.recFailed = true
+			log.Printf("[hub] 录像文件创建失败（本会话不再录像）: %v", err)
+			return
+		}
+		s.rec = w
+	}
+	if err := s.rec.WriteFrame(raw); err != nil {
+		log.Printf("[hub] 录像写入失败: %v", err)
+	}
 }
 
 func (h *Hub) endSession(deviceID string) {
@@ -464,6 +527,46 @@ func (h *Hub) endSession(deviceID string) {
 	if ok && s.Viewer != nil {
 		_ = s.Viewer.WriteMessage(mustJSON(proto.Envelope{Type: proto.TypeRCStop}))
 	}
+	// §5：会话结束落盘录像，写审计（帧数/字节数可追溯）。
+	if ok && s.rec != nil {
+		path, frames, nbytes := s.rec.Close()
+		h.audit(s.Operator, "rc_record_saved", s.DeviceID,
+			fmt.Sprintf("远控录像已留存 %s（%d 帧，%d 字节密文）", filepath.Base(path), frames, nbytes), "success")
+		log.Printf("[hub] rc recording saved session=%s frames=%d bytes=%d", s.SessionID, frames, nbytes)
+	}
+}
+
+// handleRecordings 列出加密录像文件（§5）：名称/大小/修改时间（不回传内容；回放需 master 密钥）。
+func (h *Hub) handleRecordings(w http.ResponseWriter, r *http.Request, _ crypto.Claims) {
+	if !h.recEnabled {
+		writeJSON(w, map[string]any{"enabled": false, "total": 0, "recordings": []any{}})
+		return
+	}
+	entries, err := os.ReadDir(h.recDir)
+	if err != nil && !os.IsNotExist(err) {
+		writeJSON(w, map[string]any{"error": err.Error()})
+		return
+	}
+	type item struct {
+		Name     string    `json:"name"`
+		Bytes    int64     `json:"bytes"`
+		Modified time.Time `json:"modified"`
+	}
+	var list []item
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".yrec") {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		list = append(list, item{Name: e.Name(), Bytes: info.Size(), Modified: info.ModTime().UTC()})
+	}
+	if list == nil {
+		list = []item{}
+	}
+	writeJSON(w, map[string]any{"enabled": true, "retention_days": h.recRetention, "total": len(list), "recordings": list})
 }
 
 // ---- Viewer 长连接（M4 远控）----
@@ -521,7 +624,7 @@ func (h *Hub) handleViewerWS(w http.ResponseWriter, r *http.Request) {
 			h.audit(p.Operator, "rc_start", p.DeviceID, "远控会话开启", "success")
 			log.Printf("[hub] rc session start device=%s operator=%s", p.DeviceID, p.Operator)
 
-		case proto.TypeRCInput, proto.TypeRCStop, proto.TypeRCSelect, proto.TypeRCOffer, proto.TypeRCCandidate, proto.TypeRCQos:
+		case proto.TypeRCInput, proto.TypeRCStop, proto.TypeRCSelect, proto.TypeRCOffer, proto.TypeRCCandidate, proto.TypeRCQos, proto.TypeRCPing:
 			h.mu.Lock()
 			agentConn, ok := h.conns[deviceID]
 			h.mu.Unlock()

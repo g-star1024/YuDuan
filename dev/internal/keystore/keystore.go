@@ -41,6 +41,22 @@ func LoadHMACSecret() string {
 	return ""
 }
 
+// LoadRecordKey 取得远控录像加密主密钥（32 字节 hex，§5 录像留存）。
+// 优先级：YUDUAN_RECORD_KEY 环境变量 → YUDUAN_RECORD_KEY_FILE 文件内容。
+// 返回 nil 表示未配置——调用方应从 HMAC 密钥派生开发态兜底密钥（record.DeriveMaster），
+// 生产环境必须显式配置独立密钥（与信令密钥隔离，避免录像泄露波及控制面）。
+func LoadRecordKey() []byte {
+	if v := os.Getenv("YUDUAN_RECORD_KEY"); v != "" {
+		return parseHexSeed(v)
+	}
+	if f := os.Getenv("YUDUAN_RECORD_KEY_FILE"); f != "" {
+		if b, err := os.ReadFile(f); err == nil {
+			return parseHexSeed(strings.TrimSpace(string(b)))
+		}
+	}
+	return nil
+}
+
 // parseHexSeed 将 64 字符 hex 解析为 32 字节；非法返回 nil。
 func parseHexSeed(s string) []byte {
 	s = strings.TrimSpace(s)

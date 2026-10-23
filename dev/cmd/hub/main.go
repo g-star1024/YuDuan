@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 
 	"yuduan/internal/audit"
@@ -70,11 +71,25 @@ func main() {
 	// 时自动回退候选端口；显式指定 YUDUAN_HUB_ADDR 时失败即退出（生产端口必须可预期）。
 	plainLn, plainBound := listenPlainOrFallback(envOr("YUDUAN_HUB_ADDR", ":8080"))
 
+	// §5 加密录像留存（opt-in，默认关闭）：YUDUAN_RC_RECORD=1 开启。
+	// 密钥：YUDUAN_RECORD_KEY（32B hex）/ _FILE；未配置时由 HMAC 密钥派生开发态兜底。
+	recordEnabled := os.Getenv("YUDUAN_RC_RECORD") == "1"
+	recordRetention := 90
+	if v := os.Getenv("YUDUAN_RECORD_RETENTION_DAYS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			recordRetention = n
+		}
+	}
+
 	h := hub.NewHub(hub.HubConfig{
 		RepoDir: repoDir, Store: st, Auditor: aud, Users: us,
 		Auth: authSvc, HMACSecret: secret, HMACEnforce: enforce, DirSync: dirSync,
 		HubID: os.Getenv("YUDUAN_HUB_ID"), PublicAddr: envOr("YUDUAN_PUBLIC_ADDR", plainBound),
 		SignSeed: signSeed,
+		RecordEnabled:       recordEnabled,
+		RecordDir:           envOr("YUDUAN_RECORD_DIR", "data/recordings"),
+		RecordRetentionDays: recordRetention,
+		RecordKey:           keystore.LoadRecordKey(),
 	})
 	if adminMustChangePW {
 		log.Printf("[hub] 内置 admin 首次登录需强制改密（YUDUAN_ADMIN_MUST_CHANGE_PW=0 可关闭）")

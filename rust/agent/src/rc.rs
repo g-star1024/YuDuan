@@ -260,6 +260,8 @@ static RC_TARGET: std::sync::Mutex<Option<(u32, u32)>> = std::sync::Mutex::new(N
 /// 主端 QoS 反馈的目标帧率（§8.3.9 带宽自适应闭环）：rc_qos 到达后覆盖 capabilities.fps，
 /// 帧循环逐轮读取（会话中途可动态升降）；0 = 未设置（用默认）。新会话开始时清零。
 static RC_FPS_QOS: AtomicU64 = AtomicU64::new(0);
+/// 主端实测媒体路径 RTT（ms，§8.3.11）；0 = 未知/未探测（不夹上限）。
+static RC_RTT_MS: AtomicU64 = AtomicU64::new(0);
 
 // ===================== P2P / 二进制帧媒体环（§8.3 运行时接入） =====================
 
@@ -506,9 +508,10 @@ pub fn handle_rc_candidate(
     }
 }
 
-/// 处理 rc_qos：主端反馈的目标帧率（§8.3.9 带宽自适应闭环）。
+/// 处理 rc_qos：主端反馈的目标帧率（§8.3.9 带宽自适应闭环）+ 实测 RTT（§8.3.11）。
 /// 夹取规则：1..=120 fps 之外（含 0/负数/非数字）不应用本条反馈（保留当前值），
 /// 避免主端异常载荷把帧循环打到忙轮询或归零；fps=0 语义为「恢复默认」→ 清覆盖。
+/// rtt_ms 合法区间 0..=60000（超出忽略）；帧循环取 min(目标 fps, RTT 档位上限)。
 /// 帧循环逐轮读取该值，故会话中途升降立即生效，无需重建通道。
 pub fn handle_rc_qos(p: &crate::Json) {
     let fps = p.get("fps").and_then(|v| v.as_i64());
@@ -529,6 +532,46 @@ pub fn handle_rc_qos(p: &crate::Json) {
             eprintln!("[agent] rc_qos：忽略越界反馈 fps={:?}（合法区间 1..=120，0=恢复默认）", other);
         }
     }
+    // §8.3.11 传输级自适应：主端探测的媒体路径 RTT → 档位上限（与 fps 反馈独立生效）。
+    if let Some(rtt) = p.get("rtt_ms").and_then(|v| v.as_i64()) {
+        if (0..=60_000).contains(&rtt) {
+            let prev = RC_RTT_MS.swap(rtt as u64, Ordering::SeqCst);
+            match (rtt_cap_fps(rtt as u64), rtt_cap_fps(prev)) {
+                (Some(now), Some(old)) if now != old => {
+                    eprintln!("[agent] rc_qos：RTT {}ms → 帧率上限 {} fps（原 {} fps）", rtt, now, old);
+                }
+                (Some(cap), None) => {
+                    eprintln!("[agent] rc_qos：RTT {}ms → 帧率上限 {} fps（原无限制）", rtt, cap);
+                }
+                (None, Some(_)) => {
+                    eprintln!("[agent] rc_qos：RTT {}ms → 网络良好，解除帧率上限", rtt);
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// 处理 rc_ping：主端 RTT 探测（§8.3.11）。原样回显 t0，主端 RTT = now - t0。
+pub fn handle_rc_ping(
+    writer: &Writer,
+    rng: &Arc<Mutex<crate::Lcg>>,
+    seq: &Arc<Mutex<u64>>,
+    p: &crate::Json,
+) {
+    let session = RC_SESSION.lock().unwrap().clone().unwrap_or_default();
+    let t0 = p.get("t0").and_then(|v| v.as_i64()).unwrap_or(0);
+    let payload = format!(
+        "{{\"session_id\":{},\"t0\":{}}}",
+        json_string(&session),
+        t0
+    );
+    let msg = {
+        let mut rng_g = rng.lock().unwrap();
+        let mut seq_g = seq.lock().unwrap();
+        crate::build_envelope(&mut rng_g, &mut seq_g, "rc_pong", &payload)
+    };
+    let _ = send_ws_text(&mut *writer.lock().unwrap(), msg.as_bytes());
 }
 
 /// 二进制媒体帧发送结果。
@@ -630,6 +673,7 @@ pub fn start_rc(writer: Writer, rng: Arc<Mutex<crate::Lcg>>, seq: Arc<Mutex<u64>
     RC_STOP.store(false, Ordering::SeqCst);
     let gen = RC_GEN.fetch_add(1, Ordering::SeqCst) + 1; // 新会话代次（旧帧线程随之失效）
     RC_WANT_P2P.store(false, Ordering::SeqCst);
+    RC_RTT_MS.store(0, Ordering::SeqCst); // 新会话 RTT 未知，等主端重新探测
     *RC_MEDIA.lock().unwrap() = None; // 新会话重新协商媒体通道
     *RC_TARGET.lock().unwrap() = None; // 新会话重新探测目标分辨率
     RC_FPS_QOS.store(0, Ordering::SeqCst); // 新会话清主端 QoS 反馈（恢复默认帧率）
@@ -756,8 +800,8 @@ pub fn start_rc(writer: Writer, rng: Arc<Mutex<crate::Lcg>>, seq: Arc<Mutex<u64>
     });
 }
 
-/// 远控目标帧间隔（ms）：优先级 rc_qos 主端反馈（§8.3.9）→ YUDUAN_RC_FPS → capabilities.fps。
-/// 下限 1ms 防零除/忙轮询；帧循环逐轮调用（会话中途 QoS 升降立即生效）。
+/// 远控目标帧间隔（ms）：优先级 rc_qos 主端反馈（§8.3.9）→ YUDUAN_RC_FPS → capabilities.fps，
+/// 再与 RTT 档位上限（§8.3.11）取 min。下限 1ms 防零除/忙轮询；帧循环逐轮调用。
 fn rc_frame_interval_ms() -> u64 {
     let qos = RC_FPS_QOS.load(Ordering::SeqCst);
     let fps = if qos > 0 {
@@ -769,7 +813,27 @@ fn rc_frame_interval_ms() -> u64 {
             .filter(|v| *v > 0)
             .unwrap_or_else(|| crate::rc_media::default_capabilities().fps.max(1) as u64)
     };
+    let rtt = RC_RTT_MS.load(Ordering::SeqCst);
+    let fps = if rtt > 0 {
+        fps.min(rtt_cap_fps(rtt).unwrap_or(fps))
+    } else {
+        fps
+    };
     (1000 / fps).max(1)
+}
+
+/// RTT → 帧率上限档位（§8.3.11 传输级自适应）。None = 网络良好不夹。
+/// 档位：≤80ms 不限；≤200ms 15fps；≤400ms 8fps；>400ms 4fps（跨中继两跳 + 解码余量）。
+fn rtt_cap_fps(rtt_ms: u64) -> Option<u64> {
+    if rtt_ms <= 80 {
+        None
+    } else if rtt_ms <= 200 {
+        Some(15)
+    } else if rtt_ms <= 400 {
+        Some(8)
+    } else {
+        Some(4)
+    }
 }
 
 pub fn stop_rc() {
@@ -1816,6 +1880,51 @@ mod tests {
 
         std::env::remove_var("YUDUAN_RC_FPS");
         let _ = d;
+    }
+
+    #[test]
+    fn rc_rtt_cap_applies_over_target_fps() {
+        // §8.3.11 传输级自适应：RTT 档位上限与目标 fps 取 min；rc_qos.rtt_ms 越界忽略。
+        RC_FPS_QOS.store(0, Ordering::SeqCst);
+        RC_RTT_MS.store(0, Ordering::SeqCst);
+        std::env::set_var("YUDUAN_RC_FPS", "30");
+
+        // 档位边界：≤80 不限，≤200 → 15，≤400 → 8，>400 → 4
+        assert_eq!(rtt_cap_fps(0), None);
+        assert_eq!(rtt_cap_fps(80), None);
+        assert_eq!(rtt_cap_fps(81), Some(15));
+        assert_eq!(rtt_cap_fps(200), Some(15));
+        assert_eq!(rtt_cap_fps(201), Some(8));
+        assert_eq!(rtt_cap_fps(400), Some(8));
+        assert_eq!(rtt_cap_fps(401), Some(4));
+        assert_eq!(rtt_cap_fps(5000), Some(4));
+
+        // rc_qos 携带 rtt_ms=300 → 目标 30fps 被夹到 8fps（125ms 间隔）
+        let p: crate::Json = crate::parse_json(br#"{"session_id":"s","fps":0,"rtt_ms":300}"#).expect("应可解析");
+        handle_rc_qos(&p);
+        assert_eq!(RC_RTT_MS.load(Ordering::SeqCst), 300);
+        assert_eq!(rc_frame_interval_ms(), 125, "RTT 300ms 应夹 8fps");
+
+        // rtt 越界（60001/负数）忽略，不影响当前值
+        for bad in [br#"{"rtt_ms":60001}"#.as_slice(), br#"{"rtt_ms":-1}"#] {
+            let p: crate::Json = crate::parse_json(bad).expect("应可解析");
+            handle_rc_qos(&p);
+            assert_eq!(RC_RTT_MS.load(Ordering::SeqCst), 300, "越界 rtt 不应改变当前值");
+        }
+
+        // RTT 恢复良好（60ms）→ 回到目标 30fps（33ms）
+        let p: crate::Json = crate::parse_json(br#"{"rtt_ms":60}"#).expect("应可解析");
+        handle_rc_qos(&p);
+        assert_eq!(rc_frame_interval_ms(), 33, "RTT 良好应解除上限");
+
+        // 主端 fps 反馈与 RTT 上限同时生效：取 min（反馈 2fps → 500ms）
+        let p: crate::Json = crate::parse_json(br#"{"fps":2}"#).expect("应可解析");
+        handle_rc_qos(&p);
+        assert_eq!(rc_frame_interval_ms(), 500, "min(反馈 2fps, RTT 上限 15fps) = 2fps");
+
+        std::env::remove_var("YUDUAN_RC_FPS");
+        RC_FPS_QOS.store(0, Ordering::SeqCst);
+        RC_RTT_MS.store(0, Ordering::SeqCst);
     }
 
     #[test]

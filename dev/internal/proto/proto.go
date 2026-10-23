@@ -49,6 +49,8 @@ const (
 	TypeRCAnswer       = "rc_answer"       // Agent→Hub→Viewer：P2P 连接应答（含候选地址）
 	TypeRCCandidate    = "rc_candidate"    // 双向：追加 ICE-lite 候选地址
 	TypeRCQos          = "rc_qos"          // Viewer→Hub→Agent：主端反馈目标帧率（§8.3.9 带宽自适应）
+	TypeRCPing         = "rc_ping"         // Viewer→Hub→Agent：主端 RTT 探测（§8.3.11 传输级自适应）
+	TypeRCPong         = "rc_pong"         // Agent→Hub→Viewer：RTT 探测应答（回显 t0）
 
 	// —— M5 软件分发 ——
 	// sw_install 复用 TypeCommand(action="sw_install")，载荷见 CommandPayload 扩展字段
@@ -188,7 +190,15 @@ type RCCandidatePayload struct {
 type RCQosPayload struct {
 	SessionID string `json:"session_id"`
 	FPS       int    `json:"fps"`
-	Reason    string `json:"reason,omitempty"` // decode_slow / user_slider / auto_adapt ...
+	Reason    string `json:"reason,omitempty"` // decode_slow / user_slider / auto_adapt / rtt_probe ...
+	RTTMs     int64  `json:"rtt_ms,omitempty"` // 主端实测媒体路径 RTT（§8.3.11），副端按档位夹帧率上限
+}
+
+// RCPingPayload —— Viewer↔Agent 的 RTT 探测（§8.3.11）：主端发 t0=本地毫秒时间戳，
+// 副端原样回显（rc_pong）；主端 RTT = now - t0。纯应用层探测，跨中继/P2P 通道同语义。
+type RCPingPayload struct {
+	SessionID string `json:"session_id"`
+	T0        int64  `json:"t0"`
 }
 
 // —— M5 软件分发载荷 ——

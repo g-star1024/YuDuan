@@ -4,11 +4,14 @@ import (
 	"bytes"
 	"encoding/json"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"yuduan/internal/proto"
+	"yuduan/internal/record"
 	"yuduan/internal/ws"
 )
 
@@ -45,6 +48,117 @@ func readTypeWithTimeout(c *ws.Conn, d time.Duration) (string, error) {
 }
 
 var errTimeout = &simpleErr{s: "read timeout"}
+
+// TestRCRecordingEncryptedRetention 验证 §5 加密录像留存闭环（opt-in）：
+// 中继的二进制媒体帧逐帧 AES-GCM 落盘；endSession 落盘；master 密钥可回放逐帧还原。
+func TestRCRecordingEncryptedRetention(t *testing.T) {
+	recDir := t.TempDir()
+	h := NewHub(HubConfig{
+		RecordEnabled: true, RecordDir: recDir, RecordRetentionDays: 90,
+		RecordKey: []byte(bytes.Repeat([]byte{7}, 32)),
+	})
+	srv := httptest.NewServer(h.Handler())
+	defer srv.Close()
+
+	aConn, err := ws.Dial(wsURL(srv, "/ws/agent"))
+	if err != nil {
+		t.Fatalf("agent dial: %v", err)
+	}
+	defer aConn.Close()
+	reg, _ := proto.NewEnvelope(proto.TypeRegister, 0, proto.RegisterPayload{Hostname: "t-rec", OS: "macos", Arch: "arm64"})
+	regB, _ := json.Marshal(reg)
+	if err := aConn.WriteMessage(regB); err != nil {
+		t.Fatal(err)
+	}
+	ackRaw, err := aConn.ReadMessage()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ack proto.Envelope
+	_ = json.Unmarshal(ackRaw, &ack)
+	var ackP proto.RegisterAckPayload
+	_ = ack.DecodePayload(&ackP)
+
+	vConn, err := ws.Dial(wsURL(srv, "/ws/viewer"))
+	if err != nil {
+		t.Fatalf("viewer dial: %v", err)
+	}
+	defer vConn.Close()
+	req, _ := proto.NewEnvelope(proto.TypeRCRequest, 0, proto.RCRequestPayload{
+		DeviceID: ackP.DeviceID, SessionID: "s-rec", Operator: "admin",
+	})
+	reqB, _ := json.Marshal(req)
+	if err := vConn.WriteMessage(reqB); err != nil {
+		t.Fatal(err)
+	}
+	if typ, err := readTypeWithTimeout(aConn, 2*time.Second); err != nil || typ != proto.TypeRCRequest {
+		t.Fatalf("rc_request 未转发: %q %v", typ, err)
+	}
+
+	// Agent → Viewer 发 3 个二进制媒体帧（24B 头 + payload）
+	var sent [][]byte
+	for i := 0; i < 3; i++ {
+		fr := make([]byte, 24+16)
+		copy(fr, "YDYF")
+		fr[8] = byte(i)
+		for j := 24; j < len(fr); j++ {
+			fr[j] = byte(i*7 + j)
+		}
+		sent = append(sent, fr)
+		if err := aConn.WriteBinary(fr); err != nil {
+			t.Fatalf("写二进制帧 #%d: %v", i, err)
+		}
+	}
+	// 等中继 + 录像写入完成（帧回传 viewer 可作为同步点）
+	got := 0
+	deadline := time.Now().Add(3 * time.Second)
+	for got < 3 && time.Now().Before(deadline) {
+		if _, isBin, err := vConn.ReadMessageTyped(); err == nil && isBin {
+			got++
+		}
+	}
+	if got != 3 {
+		t.Fatalf("viewer 仅收到 %d/3 帧", got)
+	}
+
+	// 结束会话（rc_stop，无专用载荷）→ 落盘
+	stop, _ := proto.NewEnvelope(proto.TypeRCStop, 0, struct{}{})
+	stopB, _ := json.Marshal(stop)
+	if err := vConn.WriteMessage(stopB); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(200 * time.Millisecond)
+
+	// 文件存在且可解密回放：逐帧字节一致
+	entries, err := os.ReadDir(recDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var yrec []string
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".yrec") {
+			yrec = append(yrec, filepath.Join(recDir, e.Name()))
+		}
+	}
+	if len(yrec) != 1 {
+		t.Fatalf("应恰有 1 个录像文件，实得 %v", yrec)
+	}
+	rec, err := record.ReadAll(yrec[0], []byte(bytes.Repeat([]byte{7}, 32)))
+	if err != nil {
+		t.Fatalf("录像解密失败: %v", err)
+	}
+	if rec.Meta.SessionID != "s-rec" || rec.Meta.Operator != "admin" {
+		t.Fatalf("录像元数据不符: %+v", rec.Meta)
+	}
+	if len(rec.Frames) != 3 {
+		t.Fatalf("录像帧数不符: %d", len(rec.Frames))
+	}
+	for i := range sent {
+		if !bytes.Equal(rec.Frames[i], sent[i]) {
+			t.Fatalf("录像帧 #%d 与发送帧不一致", i)
+		}
+	}
+}
 
 // TestRCP2PRelay 验证 P2P 信令 + M4 媒体消息在中枢的中继路由正确：
 // Agent→Viewer：rc_ready/rc_frame/rc_event/rc_capabilities/rc_answer/rc_candidate
@@ -127,6 +241,16 @@ func TestRCP2PRelay(t *testing.T) {
 	send(vConn, proto.TypeRCInput, proto.RCInputPayload{SessionID: "s-1", Kind: "mouse_move", X: 10, Y: 20})
 	if typ, err := readTypeWithTimeout(aConn, 2*time.Second); err != nil || typ != proto.TypeRCInput {
 		t.Fatalf("rc_input 未中继到 Agent: typ=%q err=%v", typ, err)
+	}
+
+	// §8.3.11：rc_ping（Viewer→Agent）与 rc_pong（Agent→Viewer）双向放行
+	send(vConn, proto.TypeRCPing, proto.RCPingPayload{SessionID: "s-1", T0: 12345})
+	if typ, err := readTypeWithTimeout(aConn, 2*time.Second); err != nil || typ != proto.TypeRCPing {
+		t.Fatalf("rc_ping 未中继到 Agent: typ=%q err=%v", typ, err)
+	}
+	send(aConn, proto.TypeRCPong, proto.RCPingPayload{SessionID: "s-1", T0: 12345})
+	if typ, err := readTypeWithTimeout(vConn, 2*time.Second); err != nil || typ != proto.TypeRCPong {
+		t.Fatalf("rc_pong 未中继到 Viewer: typ=%q err=%v", typ, err)
 	}
 	// §8.3.9 带宽自适应闭环：rc_qos（viewer→agent）必须经中枢中继
 	send(vConn, proto.TypeRCQos, proto.RCQosPayload{SessionID: "s-1", FPS: 8, Reason: "decode_slow"})
