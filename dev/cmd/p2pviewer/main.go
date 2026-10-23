@@ -48,6 +48,7 @@ func main() {
 	out := flag.String("out", "/tmp/p2pviewer-out", "样例帧输出目录")
 	timeout := flag.Duration("timeout", 25*time.Second, "总体超时")
 	candidates := flag.Bool("candidates", true, "p2p 时广播本机候选地址（ICE-lite：被控端逐个尝试直连）")
+	qos := flag.Int("qos", 0, "协商后每 2s 向被控端发送 rc_qos 目标帧率（0=关闭；验证 §8.3.9 带宽自适应闭环）")
 	flag.Parse()
 	if *device == "" {
 		fatal("需指定 -device（被控设备 ID）")
@@ -184,6 +185,28 @@ func main() {
 				// ICE-lite：广播本机候选地址（被控端首跳失败时逐个尝试直连升级）。
 				if *transport == "p2p" && *candidates {
 					sendCandidates(conn, sessionID, ln)
+				}
+				// §8.3.9 带宽自适应闭环：反馈目标帧率（被控端逐轮应用，会话中途升降生效）。
+				// 首条立即发送（等 2s 的话低速用例收满前反馈根本到不了），此后每 2s 一次。
+				if *qos > 0 {
+					go func() {
+						for i := 0; ; i++ {
+							if i > 0 {
+								time.Sleep(2 * time.Second)
+							}
+							q, err := proto.NewEnvelope(proto.TypeRCQos, 0, proto.RCQosPayload{
+								SessionID: sessionID, FPS: *qos, Reason: "p2pviewer-feedback",
+							})
+							if err != nil {
+								return
+							}
+							qB, _ := json.Marshal(q)
+							if err := conn.WriteMessage(qB); err != nil {
+								return
+							}
+							logf("已发送 rc_qos fps=%d", *qos)
+						}
+					}()
 				}
 				}
 		case proto.TypeRCEvent:

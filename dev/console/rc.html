@@ -42,6 +42,11 @@
       <button id="startBtn">发起远控</button>
       <button id="renegoBtn" class="ghost" disabled>重新协商</button>
       <button id="stopBtn" class="ghost">结束会话</button>
+      <span title="§8.3.9 带宽自适应：主端反馈目标帧率，被控端逐轮应用">
+        <input type="checkbox" id="qosAuto" checked>自适应
+        <input type="range" id="fpsRange" min="2" max="30" value="15" style="width:90px;vertical-align:middle" disabled>
+        <span id="fpsVal">15</span> fps
+      </span>
       <span id="status" class="status"></span>
     </div>
     <div class="layout">
@@ -81,6 +86,12 @@
     let mediaTransport = 'relay';        // 浏览器无法监听裸 TCP：固定经中枢二进制中继
     let frameTimes = [];                 // 近 5s 帧到达时刻（fps）
     let byteWindow = [];                 // 近 1s 帧载荷（码率）
+    // —— §8.3.9 带宽自适应（rc_qos 反馈闭环）——
+    let capsFps = 15;                    // 被控端能力宣告的帧率上限
+    let qosFps = null;                   // 当前反馈给被控端的目标帧率（null=尚未反馈）
+    let renderCosts = [];                // 近 20 帧「到达→绘制」耗时（ms）
+    let qosHealthyRounds = 0;            // 连续健康评估轮数（升档计数）
+    let qosLastSent = 0;                 // 上次发送 rc_qos 的时刻（节流 3s）
 
     function log(msg) {
       const t = new Date().toLocaleTimeString('zh-CN');
@@ -123,8 +134,64 @@
         `通道：${mediaTransport} · 编码：${CODEC_NAMES[codec] || codec} · 分辨率：${frameW}×${frameH} · ${fps} fps · ${kbps} KB/s`;
     }
 
+    // —— §8.3.9 带宽自适应：rc_qos 反馈闭环（主端实测 → 被控端逐轮应用）——
+    function sendQos(fps, reason) {
+      if (!ws || !sessionID) return;
+      qosFps = fps;
+      qosLastSent = Date.now();
+      const env = { ver: 1, msg_id: 'm' + Date.now(), ts: Math.floor(Date.now() / 1000), type: 'rc_qos', seq: 1,
+        payload: { session_id: sessionID, fps, reason } };
+      ws.send(JSON.stringify(env));
+      document.getElementById('fpsVal').textContent = String(fps || capsFps);
+      log(`已发送 rc_qos：${fps === 0 ? '恢复默认' : fps + ' fps'}（${reason}）`);
+    }
+
+    // 记录一帧「到达→绘制完成」耗时（客户端自适应信号）。
+    function noteRenderCost(ms) {
+      renderCosts.push(ms);
+      if (renderCosts.length > 20) renderCosts.shift();
+      maybeAdaptQos();
+    }
+
+    // 自适应评估（≥3s 一次）：解码/渲染耗时逼近帧预算→降档（防持续积压）；
+    // 长期宽裕→缓慢升档（不超过被控端能力上限，避免打回拥塞）。
+    function maybeAdaptQos() {
+      if (!document.getElementById('qosAuto').checked || !ws || !sessionID) return;
+      const now = Date.now();
+      if (now - qosLastSent < 3000 || renderCosts.length < 5) return;
+      const cur = (qosFps === null) ? capsFps : qosFps;
+      const avg = renderCosts.reduce((s, x) => s + x, 0) / renderCosts.length;
+      const budget = 1000 / Math.max(cur, 1);
+      if (avg > budget * 0.8 && cur > 2) {
+        sendQos(Math.max(2, Math.floor(cur * 0.7)), 'auto_adapt');
+        qosHealthyRounds = 0;
+      } else if (avg < budget * 0.4) {
+        if (++qosHealthyRounds >= 5 && cur < capsFps) {
+          sendQos(Math.min(capsFps, cur + 2), 'auto_adapt');
+          qosHealthyRounds = 0;
+        }
+      } else {
+        qosHealthyRounds = 0;
+      }
+    }
+
+    // QoS 控件：自适应开关 + 手动帧率滑杆（手动=立即反馈 user_slider）。
+    document.getElementById('qosAuto').onchange = (e) => {
+      const manual = !e.target.checked;
+      document.getElementById('fpsRange').disabled = !manual;
+      if (manual) sendQos(parseInt(document.getElementById('fpsRange').value, 10), 'user_slider');
+      // 切回自适应：清空历史信号，从当前值重新评估
+      renderCosts = []; qosHealthyRounds = 0;
+    };
+    document.getElementById('fpsRange').oninput = (e) => {
+      document.getElementById('fpsVal').textContent = e.target.value;
+      if (document.getElementById('qosAuto').checked) return; // 自适应模式下滑杆只读展示
+      sendQos(parseInt(e.target.value, 10), 'user_slider');
+    };
+
     // 解析并渲染一帧二进制媒体帧（§8.3：24B 小端头 + payload）。
     function renderBinaryFrame(buf) {
+      const t0 = performance.now(); // 自适应信号：到达→绘制完成耗时（§8.3.9）
       if (buf.byteLength < FRAME_HEADER_LEN) { log('二进制帧过短，丢弃'); return; }
       const dv = new DataView(buf);
       if (dv.getUint32(0, true) !== FRAME_MAGIC) { log('二进制帧 magic 不匹配，丢弃'); return; }
@@ -146,19 +213,21 @@
         const blob = new Blob([new Uint8Array(buf, FRAME_HEADER_LEN, len)], { type: 'image/jpeg' });
         const url = URL.createObjectURL(blob);
         const img = new Image();
-        img.onload = () => { ctx.drawImage(img, 0, 0, canvas.width, canvas.height); URL.revokeObjectURL(url); };
+        img.onload = () => { ctx.drawImage(img, 0, 0, canvas.width, canvas.height); URL.revokeObjectURL(url); noteRenderCost(performance.now() - t0); };
         img.onerror = () => { URL.revokeObjectURL(url); };
         img.src = url;
       } else if (codec === 0 && w > 0 && h > 0) {
         // RAW_RGBA：直接 putImageData
         if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
         ctx.putImageData(new ImageData(new Uint8ClampedArray(buf, FRAME_HEADER_LEN, len), w, h), 0, 0);
+        noteRenderCost(performance.now() - t0);
       } else if (codec >= 2 && codec <= 6) {
         // 原生码流（h264/h265/vp8/vp9/av1）：优先 WebCodecs 解码渲染；
         // 不可用/失败（如验证桩码流）自动回退帧统计展示。
         if (!decodeNativeFrame(codec, new Uint8Array(buf, FRAME_HEADER_LEN, len), seq, flags, w, h)) {
           statusEl.textContent = `${CODEC_NAMES[codec] || codec} 帧 #${seq}（WebCodecs 不可用/解码失败，仅统计）`;
         }
+        noteRenderCost(performance.now() - t0);
       } else {
         statusEl.textContent = `未知编解码器 ${codec} 帧 #${seq}`;
       }
@@ -312,6 +381,7 @@
         } else if (env.type === 'rc_capabilities') {
           const p = env.payload || {};
           log(`被控端能力：${(p.codecs || []).map(c => CODEC_NAMES[c] || c).join('/')} ${p.max_w || '?'}×${p.max_h || '?'}@${p.fps || '?'}fps`);
+          capsFps = p.fps || 15; // §8.3.9 自适应上限
           populateCodecs(p.codecs || []);
           sendSelect(); // 收到能力即按偏好协商二进制帧通道
           document.getElementById('renegoBtn').disabled = false;

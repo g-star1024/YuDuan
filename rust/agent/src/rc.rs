@@ -257,6 +257,9 @@ static RC_WANT_P2P: AtomicBool = AtomicBool::new(false);
 /// 协商目标尺寸（§8.3.7 性能）：capabilities.max_w/h 与实际采集分辨率保比取偶的结果。
 /// RAW/原生路径按此降采样后送编码；原生编码器会话按同一尺寸创建（create(codec,w,h)）。
 static RC_TARGET: std::sync::Mutex<Option<(u32, u32)>> = std::sync::Mutex::new(None);
+/// 主端 QoS 反馈的目标帧率（§8.3.9 带宽自适应闭环）：rc_qos 到达后覆盖 capabilities.fps，
+/// 帧循环逐轮读取（会话中途可动态升降）；0 = 未设置（用默认）。新会话开始时清零。
+static RC_FPS_QOS: AtomicU64 = AtomicU64::new(0);
 
 // ===================== P2P / 二进制帧媒体环（§8.3 运行时接入） =====================
 
@@ -503,6 +506,31 @@ pub fn handle_rc_candidate(
     }
 }
 
+/// 处理 rc_qos：主端反馈的目标帧率（§8.3.9 带宽自适应闭环）。
+/// 夹取规则：1..=120 fps 之外（含 0/负数/非数字）不应用本条反馈（保留当前值），
+/// 避免主端异常载荷把帧循环打到忙轮询或归零；fps=0 语义为「恢复默认」→ 清覆盖。
+/// 帧循环逐轮读取该值，故会话中途升降立即生效，无需重建通道。
+pub fn handle_rc_qos(p: &crate::Json) {
+    let fps = p.get("fps").and_then(|v| v.as_i64());
+    let reason = p.get("reason").and_then(|v| v.as_str()).unwrap_or("unspecified");
+    match fps {
+        Some(0) => {
+            RC_FPS_QOS.store(0, Ordering::SeqCst);
+            eprintln!("[agent] rc_qos：主端请求恢复默认帧率（reason={}）", reason);
+        }
+        Some(f) if f >= 1 && f <= 120 => {
+            RC_FPS_QOS.store(f as u64, Ordering::SeqCst);
+            eprintln!(
+                "[agent] rc_qos：主端反馈目标 {} fps（reason={}，间隔预算 {}ms）",
+                f, reason, 1000 / f as u64
+            );
+        }
+        other => {
+            eprintln!("[agent] rc_qos：忽略越界反馈 fps={:?}（合法区间 1..=120，0=恢复默认）", other);
+        }
+    }
+}
+
 /// 二进制媒体帧发送结果。
 enum SendOutcome {
     /// 已按协商通道作为二进制帧发送。
@@ -604,6 +632,7 @@ pub fn start_rc(writer: Writer, rng: Arc<Mutex<crate::Lcg>>, seq: Arc<Mutex<u64>
     RC_WANT_P2P.store(false, Ordering::SeqCst);
     *RC_MEDIA.lock().unwrap() = None; // 新会话重新协商媒体通道
     *RC_TARGET.lock().unwrap() = None; // 新会话重新探测目标分辨率
+    RC_FPS_QOS.store(0, Ordering::SeqCst); // 新会话清主端 QoS 反馈（恢复默认帧率）
     *RC_SESSION.lock().unwrap() = Some(session_id.clone());
 
     // 合规：本地通知 + 事件（员工知情可拒绝；开发态自动授权见 rc_event）
@@ -620,10 +649,11 @@ pub fn start_rc(writer: Writer, rng: Arc<Mutex<crate::Lcg>>, seq: Arc<Mutex<u64>
     thread::spawn(move || {
         let started = std::time::Instant::now();
         let mut frame_seq: i64 = 0;
-        // 可变帧率（§8.3.7）：目标帧率取 capabilities.fps（可用 YUDUAN_RC_FPS 覆盖）。
+        // 可变帧率（§8.3.7/§8.3.9）：目标帧率优先级 = rc_qos 主端反馈 → YUDUAN_RC_FPS → capabilities.fps。
         // 原实现每轮固定 sleep 500ms，实际帧率 = 1/(0.5s + 采集编码耗时)， negotiated fps 形同虚设；
         // 改为「到点出帧」：每轮结束算出下一帧截止时刻，sleep 只补足剩余预算——
         // 采集/编码慢时自然降帧（不叠加延迟），机器空闲时贴合目标帧率。
+        // 间隔逐轮重算：主端 rc_qos 反馈（带宽/解码能力自适应）会话中途升降立即生效。
         let interval_ms = rc_frame_interval_ms();
         if interval_ms <= 500 {
             eprintln!("[agent] 远控帧率目标 {} fps（间隔预算 {}ms；YUDUAN_RC_FPS 可调）",
@@ -641,6 +671,8 @@ pub fn start_rc(writer: Writer, rng: Arc<Mutex<crate::Lcg>>, seq: Arc<Mutex<u64>
                 thread::sleep(next_tick - now);
             }
             let tick = Instant::now();
+            // 逐轮重算间隔：主端 rc_qos 可能在上一帧处理期间到达（§8.3.9）。
+            let interval_ms = rc_frame_interval_ms();
             next_tick = tick + Duration::from_millis(interval_ms);
             if RC_GEN.load(Ordering::SeqCst) != gen || RC_STOP.load(Ordering::SeqCst) {
                 break;
@@ -724,14 +756,19 @@ pub fn start_rc(writer: Writer, rng: Arc<Mutex<crate::Lcg>>, seq: Arc<Mutex<u64>
     });
 }
 
-/// 远控目标帧间隔（ms）：capabilities.fps → 1000/fps；YUDUAN_RC_FPS 可覆盖。
-/// 下限 1ms 防零除/忙轮询；帧循环按此预算做开销补偿式休眠。
+/// 远控目标帧间隔（ms）：优先级 rc_qos 主端反馈（§8.3.9）→ YUDUAN_RC_FPS → capabilities.fps。
+/// 下限 1ms 防零除/忙轮询；帧循环逐轮调用（会话中途 QoS 升降立即生效）。
 fn rc_frame_interval_ms() -> u64 {
-    let fps = std::env::var("YUDUAN_RC_FPS")
-        .ok()
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or_else(|| crate::rc_media::default_capabilities().fps.max(1) as u64);
+    let qos = RC_FPS_QOS.load(Ordering::SeqCst);
+    let fps = if qos > 0 {
+        qos
+    } else {
+        std::env::var("YUDUAN_RC_FPS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or_else(|| crate::rc_media::default_capabilities().fps.max(1) as u64)
+    };
     (1000 / fps).max(1)
 }
 
@@ -1722,6 +1759,39 @@ mod tests {
         std::env::set_var("YUDUAN_RC_FPS", "1000000");
         assert_eq!(rc_frame_interval_ms(), 1);
         std::env::remove_var("YUDUAN_RC_FPS");
+    }
+
+    #[test]
+    fn rc_qos_override_drives_interval_and_clamps() {
+        // §8.3.9 带宽自适应闭环：rc_qos 反馈优先级高于环境变量与默认值；
+        // 越界（负数/超大/非数字）不应用；0 = 恢复默认（清覆盖）。
+        std::env::remove_var("YUDUAN_RC_FPS");
+        RC_FPS_QOS.store(0, Ordering::SeqCst);
+        let d = rc_frame_interval_ms();
+
+        // 合法反馈：4fps → 250ms/帧（优先级高于 env）
+        std::env::set_var("YUDUAN_RC_FPS", "10");
+        let p: crate::Json = crate::parse_json(br#"{"session_id":"s","fps":4,"reason":"decode_slow"}"#)
+            .expect("合法 qos 载荷应可解析");
+        handle_rc_qos(&p);
+        assert_eq!(RC_FPS_QOS.load(Ordering::SeqCst), 4);
+        assert_eq!(rc_frame_interval_ms(), 250, "QoS 覆盖应优先于 env/默认");
+
+        // 越界反馈：不应用（保留 4）
+        for bad in [br#"{"fps":-3}"#.as_slice(), br#"{"fps":500}"#, br#"{"fps":"abc"}"#, br#"{}"#] {
+            let p: crate::Json = crate::parse_json(bad).expect("越界载荷本身应可解析");
+            handle_rc_qos(&p);
+            assert_eq!(RC_FPS_QOS.load(Ordering::SeqCst), 4, "越界反馈不应改变当前值");
+        }
+
+        // fps=0：恢复默认（清覆盖后回到 env=10）
+        let p: crate::Json = crate::parse_json(br#"{"fps":0}"#).expect("fps=0 应可解析");
+        handle_rc_qos(&p);
+        assert_eq!(RC_FPS_QOS.load(Ordering::SeqCst), 0);
+        assert_eq!(rc_frame_interval_ms(), 100, "清覆盖后应回到 env 值");
+
+        std::env::remove_var("YUDUAN_RC_FPS");
+        let _ = d;
     }
 
     #[test]

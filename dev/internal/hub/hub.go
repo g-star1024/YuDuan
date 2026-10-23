@@ -521,7 +521,7 @@ func (h *Hub) handleViewerWS(w http.ResponseWriter, r *http.Request) {
 			h.audit(p.Operator, "rc_start", p.DeviceID, "远控会话开启", "success")
 			log.Printf("[hub] rc session start device=%s operator=%s", p.DeviceID, p.Operator)
 
-		case proto.TypeRCInput, proto.TypeRCStop, proto.TypeRCSelect, proto.TypeRCOffer, proto.TypeRCCandidate:
+		case proto.TypeRCInput, proto.TypeRCStop, proto.TypeRCSelect, proto.TypeRCOffer, proto.TypeRCCandidate, proto.TypeRCQos:
 			h.mu.Lock()
 			agentConn, ok := h.conns[deviceID]
 			h.mu.Unlock()

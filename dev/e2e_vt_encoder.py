@@ -214,6 +214,22 @@ def main():
                 ok2, detail = analyse_stream("H.264", outdir, "h264")
                 check("P2P H.264 码流校验", ok2, detail)
 
+        # QoS 带宽自适应闭环（§8.3.9）：viewer 周期反馈 4fps，副端逐轮应用——
+        # 8 帧应耗时 ≈8/4=2s（无反馈时实际 ~11fps 只需 <1s），且副端日志应有应用记录。
+        if only in ("all", "qos", "h264"):
+            outdir = os.path.join(OUT, "h264-qos")
+            ok, out, el = collect(2, "relay", 8, outdir, extra=["-qos", "4"])
+            try:
+                alog = open(os.path.join(OUT, "agent.log"), encoding="utf-8", errors="ignore").read()
+            except Exception:
+                alog = ""
+            applied = "主端反馈目标 4 fps" in alog
+            check("H.264 QoS 限帧（主端反馈 4fps 生效）", ok and applied and el > 1.5,
+                  f"{el:.1f}s qos_applied={applied}")
+            for line in out.splitlines():
+                if "rc_qos" in line or "P2PVIEWER_OK" in line:
+                    print("      " + line.strip()[:150])
+
         # 能力宣告：副端应宣告 h264/h265（原生库真实可用）
         caps = ""
         for line in (agent.stdout.readlines() if False else []):

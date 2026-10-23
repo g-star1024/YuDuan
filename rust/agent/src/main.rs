@@ -1385,6 +1385,13 @@ fn session(url: &str) -> std::io::Result<()> {
                             rc::handle_rc_candidate(&ws.writer.clone(), &rng, &seq, p);
                         }
                     }
+                    // 生产化（§8.3.9 带宽自适应闭环）：主端反馈目标帧率（解码/渲染实测或用户调节），
+                    // 副端夹取后逐轮应用——会话中途升降立即生效。
+                    "rc_qos" => {
+                        if let Some(p) = env.get("payload") {
+                            rc::handle_rc_qos(p);
+                        }
+                    }
                     _ => {
                         // 其它类型优雅忽略，不崩溃
                         eprintln!("[agent] 忽略未知/不相关消息类型: {}", msg_type);

@@ -48,6 +48,7 @@ const (
 	TypeRCOffer        = "rc_offer"        // Viewer→Hub→Agent：P2P 连接提议（含候选地址）
 	TypeRCAnswer       = "rc_answer"       // Agent→Hub→Viewer：P2P 连接应答（含候选地址）
 	TypeRCCandidate    = "rc_candidate"    // 双向：追加 ICE-lite 候选地址
+	TypeRCQos          = "rc_qos"          // Viewer→Hub→Agent：主端反馈目标帧率（§8.3.9 带宽自适应）
 
 	// —— M5 软件分发 ——
 	// sw_install 复用 TypeCommand(action="sw_install")，载荷见 CommandPayload 扩展字段
@@ -179,6 +180,15 @@ type RCAnswerPayload struct {
 type RCCandidatePayload struct {
 	SessionID string   `json:"session_id"`
 	Candidate string   `json:"candidate"`
+}
+
+// RCQosPayload —— Viewer→Hub→Agent 的服务质量反馈（§8.3.9 带宽自适应闭环）：
+// 主端根据本地解码/渲染实测（或用户调节）请求被控端的目标帧率；被控端夹取后应用，
+// 会话中途可多次发送（动态升降）。FPS=0 表示恢复 capabilities.fps 默认值。
+type RCQosPayload struct {
+	SessionID string `json:"session_id"`
+	FPS       int    `json:"fps"`
+	Reason    string `json:"reason,omitempty"` // decode_slow / user_slider / auto_adapt ...
 }
 
 // —— M5 软件分发载荷 ——

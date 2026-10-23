@@ -128,6 +128,11 @@ func TestRCP2PRelay(t *testing.T) {
 	if typ, err := readTypeWithTimeout(aConn, 2*time.Second); err != nil || typ != proto.TypeRCInput {
 		t.Fatalf("rc_input 未中继到 Agent: typ=%q err=%v", typ, err)
 	}
+	// §8.3.9 带宽自适应闭环：rc_qos（viewer→agent）必须经中枢中继
+	send(vConn, proto.TypeRCQos, proto.RCQosPayload{SessionID: "s-1", FPS: 8, Reason: "decode_slow"})
+	if typ, err := readTypeWithTimeout(aConn, 2*time.Second); err != nil || typ != proto.TypeRCQos {
+		t.Fatalf("rc_qos 未中继到 Agent: typ=%q err=%v", typ, err)
+	}
 
 	// 4) Agent → Viewer 方向：rc_ready/rc_frame/rc_event/rc_capabilities/rc_answer/rc_candidate 必须送达 Viewer
 	send(aConn, proto.TypeRCReady, proto.RCReadyPayload{SessionID: "s-1", OK: true})
