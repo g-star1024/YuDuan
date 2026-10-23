@@ -5,8 +5,10 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"log"
+	"net"
 	"net/http"
 	"os"
+	"strings"
 
 	"yuduan/internal/audit"
 	"yuduan/internal/auth"
@@ -63,10 +65,15 @@ func main() {
 		log.Printf("[hub] 目录同步源：%s", dirFile)
 	}
 
+	// 明文监听提前绑定（PublicAddr 兜底要用实际绑定地址）：默认 :8080 被占用
+	// （本机常见：Docker Desktop 占 8080，曾致「hub 启动即退、控制台全部网络错误」）
+	// 时自动回退候选端口；显式指定 YUDUAN_HUB_ADDR 时失败即退出（生产端口必须可预期）。
+	plainLn, plainBound := listenPlainOrFallback(envOr("YUDUAN_HUB_ADDR", ":8080"))
+
 	h := hub.NewHub(hub.HubConfig{
 		RepoDir: repoDir, Store: st, Auditor: aud, Users: us,
 		Auth: authSvc, HMACSecret: secret, HMACEnforce: enforce, DirSync: dirSync,
-		HubID: os.Getenv("YUDUAN_HUB_ID"), PublicAddr: envOr("YUDUAN_PUBLIC_ADDR", plainAddrGuess()),
+		HubID: os.Getenv("YUDUAN_HUB_ID"), PublicAddr: envOr("YUDUAN_PUBLIC_ADDR", plainBound),
 		SignSeed: signSeed,
 	})
 	if adminMustChangePW {
@@ -91,7 +98,6 @@ func main() {
 
 	go h.StartReaper()
 
-	plainAddr := envOr("YUDUAN_HUB_ADDR", ":8080")
 	// TLS 监听：未设置该变量时默认 :8443；显式设为空串 = 关闭 TLS（多实例测试/纯内网明文部署）
 	tlsAddr := os.Getenv("YUDUAN_TLS_ADDR")
 	if _, ok := os.LookupEnv("YUDUAN_TLS_ADDR"); !ok {
@@ -148,12 +154,30 @@ func main() {
 		}
 	}
 
-	log.Printf("[hub] 明文中枢监听 %s（http + ws）；控制台 / ；软件仓库 %s", plainAddr, repoDir)
-	log.Fatal(http.ListenAndServe(plainAddr, h.Handler()))
+	log.Printf("[hub] 明文中枢监听 %s（http + ws）；控制台 / ；软件仓库 %s", plainBound, repoDir)
+	log.Fatal(http.Serve(plainLn, h.Handler()))
 }
 
-func plainAddrGuess() string {
-	return envOr("YUDUAN_HUB_ADDR", ":8080")
+// listenPlainOrFallback 绑定明文监听。仅当使用默认 :8080 且失败原因是端口占用时
+// 才自动回退候选端口（并醒目提示 Agent 连接地址需同步）；其余失败一律退出。
+func listenPlainOrFallback(addr string) (net.Listener, string) {
+	ln, err := net.Listen("tcp", addr)
+	if err == nil {
+		return ln, addr
+	}
+	if addr != ":8080" || !strings.Contains(err.Error(), "address already in use") {
+		log.Fatalf("[hub] 明文端口监听失败 %s: %v（可设 YUDUAN_HUB_ADDR 换端口）", addr, err)
+	}
+	for _, alt := range []string{":8081", ":8082", ":8083", ":18080"} {
+		l2, e2 := net.Listen("tcp", alt)
+		if e2 == nil {
+			log.Printf("[hub] ⚠️ %s 被占用（本机常见：Docker Desktop），自动改用 %s", addr, alt)
+			log.Printf("[hub] ⚠️ 固定端口请设 YUDUAN_HUB_ADDR=%s；Agent 连接需同步 YUDUAN_HUB=ws://<中枢IP>%s/ws/agent", alt, alt)
+			return l2, alt
+		}
+	}
+	log.Fatalf("[hub] %s 与候选端口（8081-8083/18080）均被占用，请用 YUDUAN_HUB_ADDR 指定空闲端口", addr)
+	return nil, addr
 }
 
 func envOr(k, def string) string {
