@@ -180,12 +180,16 @@
   - Windows：GDI `BitBlt` + `GetDIBits`（BI_RGB 32bpp，负高度自顶向下，交换 B/R）。
   - 实测（macOS 3584×2240）：RAW_RGBA 帧载荷 32,112,640 B = 宽×高×4，端到端 3 帧全过。无权限/无显示/布局不符返回 None，协商期探测后诚实回退 JPEG。
 - **ICE-lite 候选交换（已接入并实测）**：主端（p2pviewer）按监听绑定方式生成候选——具体 IP 绑定 → 唯一候选；通配绑定（0.0.0.0/::）→ 枚举非回送网卡 IPv4 + 监听端口；`rc_offer`（批量）+ `rc_candidate`（增量）经中枢中继。被控端 `try_candidate`：仅 `RC_WANT_P2P` 且尚无 P2P 通道时逐个 dial，成功即替换通道（保留协商 codec）并发 `media_selected`。实测两型：具体绑定候选 `127.0.0.1:port` 升级成功；通配绑定候选 `192.168.0.109:port`（LAN IP）升级成功。
-- **原生编码器 C-ABI（已端到端验证）**：`clang -dynamiclib` 编译验证桩（仅接受 h264，输出 `"STUB"`+RGBA），`YUDUAN_ENCODER_LIB` 指向后：能力探测宣告 `codecs=[raw_rgba,jpeg,h264]`（h265/vp8/vp9/av1 被桩拒绝故不宣告）；协商 h264 → RGBA 采集 → 桩编码 → 二进制帧，对端校验载荷首 4 字节为 `STUB`、总长 = 宽×高×4+4，3 帧全过。真实 H.264/H.265 编码器动态库按同一 ABI 供给即可上线。
+- **原生编码器 C-ABI（已端到端验证：桩 + 真实 VideoToolbox 库）**：
+  - 验证桩：`dev/fixtures/yuduan_enc_stub.c`（仅接受 h264，输出 `"STUB"`+RGBA），对端校验载荷首 4 字节 `STUB`、总长 = 宽×高×4+4，3 帧全过。
+  - **真实库**：`dev/encoder-vt/`（macOS VideoToolbox 后端，`build.sh` 构建）。要点：H.264 强制软件编码器（部分机器 HW 冷启动病态缓慢）；`create()` 内编码黑帧**预热**并捕获参数集（H.264: SPS/PPS；HEVC: VPS/SPS/PPS），参数集随首个真实输出前置、该输出强制 IDR（码流自首帧可解码）；每次编码经 `sourceFrameRefCon` 携带请求代次，**迟到回调按代次丢弃**（防预热超时后的过期输出污染当前帧）。
+  - **实测（macOS，真实 HEVC）**：能力宣告 `codecs=[raw_rgba,jpeg,h265]`（h264 探测失败不虚标——本机 H.264 编码器服务当时故障，属诚实行为）；协商 h265 → RGBA 采集 3584×2240 → 降采样 1728×1080 → VT 编码 → 二进制帧：首帧 146,982 B = Annex-B + VPS（`00 00 00 01 40...`），后续 P 帧 3.5~5.9 KB（真实压缩特征，对比 RAW 7.46MB/帧），4 帧全过。探测失败的 codec 诚实回退 JPEG 并告知。
+  - 副端探测结果进程级缓存（`native_probe_cached`）——异常编码器服务下单次探测可达数十秒，不重复惩罚。
 - **原生码流解码渲染（浏览器参考台已接 WebCodecs）**：`rc.html` 对 h264/h265/vp8/vp9/av1 帧走 `VideoDecoder`（Annex-B 拆 NAL → avcC description（SPS/PPS）→ 4 字节长度前缀送 `EncodedVideoChunk` → `VideoFrame` 绘 canvas）；`VideoDecoder` 不可用/configure/decode 失败自动回退帧统计。NAL 拆分/avcC 组包/AVCC 转换经合成 Annex-B 流（SPS+PPS+IDR）逐字节验证。
 
 #### 8.3.7 仍缺（生产化最后段）
 
-- **真实原生编码器动态库**：H.264/H.265 等（可用 VideoToolbox/VAAPI/MF 或 x264/x265 封装 C-ABI）；当前仅桩库验证 ABI 契约。
+- **其他平台真实编码器**：Linux（VAAPI 或 x264/x265）、Windows（Media Foundation）按 §8.3.3 契约供给动态库即可（macOS VideoToolbox 已落地，见 §8.3.6）。
 - **Linux/Windows 实跑**：采集（X11/GDI）与输入注入（XTest/SendInput）分支已写，需对应机器实测；本机（macOS）已全量验证。
-- **媒体环性能**：帧循环当前 500ms/帧（2fps）、5K 屏 RAW 32MB/帧；生产需协商降采样（capabilities.max_w/h 生效）、可变帧率与带宽自适应。
+- **媒体环性能（降采样已生效，余自适应）**：RAW/原生路径已按 `capabilities.max_w/h` 保比取偶降采样（5K 屏 RAW 从 32MB/帧降至 7.5MB/帧，实测 1728×1080）；HEVC P 帧 ~4KB/帧。仍缺：可变帧率与带宽自适应、JPEG 工具链路径降采样（当前全分辨率）。
 - **录像留存**：§5 加密录像留存策略待产品决策后实现。

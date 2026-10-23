@@ -190,6 +190,21 @@ pub fn parse_capabilities(s: &str) -> Option<Capabilities> {
 /// Agent 默认可产出编解码器：RAW_RGBA + JPEG 始终可用（纯 Rust 回退）；
 /// 配置了 YUDUAN_ENCODER_LIB 时，逐个探测原生编解码器（H264/H265/VP8/VP9/AV1），
 /// 仅宣告库真实支持（能创建句柄）的——不虚标能力。
+/// 原生编码器探测缓存（进程级）：探测要真实创建编码器会话（含预热），
+/// 编码器服务异常时单次探测可达数十秒，必须缓存避免每次会话重复惩罚。
+pub fn native_probe_cached(codec: u8) -> bool {
+    use std::sync::Mutex;
+    static CACHE: Mutex<Vec<(u8, bool)>> = Mutex::new(Vec::new());
+    let mut cache = CACHE.lock().unwrap();
+    if let Some(&(_, ok)) = cache.iter().find(|(c, _)| *c == codec) {
+        return ok;
+    }
+    // 探测用小尺寸会话（仅验证库能否创建该编解码器句柄，立即销毁）。
+    let ok = NativeEncoder::try_load(codec, 640, 360).is_some();
+    cache.push((codec, ok));
+    ok
+}
+
 pub fn agent_codecs() -> Vec<u8> {
     let mut v = vec![CODEC_RAW_RGBA, CODEC_JPEG];
     if std::env::var("YUDUAN_ENCODER_LIB")
@@ -197,7 +212,7 @@ pub fn agent_codecs() -> Vec<u8> {
         .unwrap_or(false)
     {
         for &c in &[CODEC_H264, CODEC_H265, CODEC_VP8, CODEC_VP9, CODEC_AV1] {
-            if NativeEncoder::try_load(c).is_some() {
+            if native_probe_cached(c) {
                 v.push(c);
             }
         }
@@ -350,7 +365,8 @@ unsafe impl Send for NativeEncoder {}
 
 impl NativeEncoder {
     /// 尝试从 YUDUAN_ENCODER_LIB 指定动态库加载原生编码器；失败返回 None（回退纯 Rust）。
-    pub fn try_load(codec: u8) -> Option<NativeEncoder> {
+    /// w/h 为编码会话尺寸：帧循环须把采集帧缩放到同一尺寸后送编码（fit_dims/downscale_rgba）。
+    pub fn try_load(codec: u8, w: u32, h: u32) -> Option<NativeEncoder> {
         let lib = std::env::var("YUDUAN_ENCODER_LIB").ok()?;
         if lib.trim().is_empty() {
             return None;
@@ -367,11 +383,7 @@ impl NativeEncoder {
             _ => return None,
         };
         unsafe {
-            let handle = create(
-                codec_name.as_ptr() as *const std::os::raw::c_char,
-                1920,
-                1080,
-            );
+            let handle = create(codec_name.as_ptr() as *const std::os::raw::c_char, w, h);
             if handle.is_null() {
                 return None;
             }
@@ -423,9 +435,10 @@ impl Drop for NativeEncoder {
 
 /// 选择编码器：原生编解码器优先走 NativeEncoder（若库已加载），否则回退：
 /// JPEG 用透传，其余（含 RAW）用 RawRgbaEncoder。
-pub fn make_encoder(codec: u8) -> Box<dyn Encoder> {
+/// w/h = 编码会话尺寸（原生库按 create(codec,w,h) 创建会话，帧循环送同尺寸帧）。
+pub fn make_encoder(codec: u8, w: u32, h: u32) -> Box<dyn Encoder> {
     if is_native_codec(codec) {
-        if let Some(e) = NativeEncoder::try_load(codec) {
+        if let Some(e) = NativeEncoder::try_load(codec, w, h) {
             return Box::new(e);
         }
         eprintln!(
@@ -438,6 +451,48 @@ pub fn make_encoder(codec: u8) -> Box<dyn Encoder> {
         CODEC_JPEG => Box::new(JpegPassthroughEncoder),
         _ => Box::new(RawRgbaEncoder),
     }
+}
+
+// ===================== 媒体环性能：目标尺寸与降采样（§8.3.7） =====================
+
+/// 保比缩放至 max_w×max_h 内（只缩不放），并取偶（H.264/HEVC 要求偶数尺寸）。
+/// 返回 (目标宽, 目标高)；max 为 0 视为不限制（保持原尺寸，仍取偶）。
+pub fn fit_dims(cw: u32, ch: u32, max_w: u32, max_h: u32) -> (u32, u32) {
+    let even = |v: u32| v & !1;
+    let (mw, mh) = if max_w == 0 || max_h == 0 {
+        (cw, ch)
+    } else {
+        (max_w, max_h)
+    };
+    if cw == 0 || ch == 0 {
+        return (1, 1);
+    }
+    // 只缩不放：已小于上限则保持原尺寸（取偶）
+    if cw <= mw && ch <= mh {
+        return (even(cw).max(2), even(ch).max(2));
+    }
+    let scale = (mw as f64 / cw as f64).min(mh as f64 / ch as f64);
+    let tw = ((cw as f64 * scale).round() as u32).max(2);
+    let th = ((ch as f64 * scale).round() as u32).max(2);
+    (even(tw).max(2), even(th).max(2))
+}
+
+/// RGBA 最近邻缩放（紧凑 RGBA8 → 紧凑 RGBA8）。目标尺寸 ≤ 源（只缩不放）。
+pub fn downscale_rgba(data: &[u8], w: u32, h: u32, tw: u32, th: u32) -> Vec<u8> {
+    let (tw, th) = fit_dims(w, h, tw, th); // 防御：目标不超源
+    let mut out = vec![0u8; tw as usize * th as usize * 4];
+    for y in 0..th as usize {
+        let sy = (y as u64 * h as u64 / th as u64) as usize;
+        let src_row = &data[sy * w as usize * 4..(sy + 1) * w as usize * 4];
+        let dst_row = &mut out[y * tw as usize * 4..(y + 1) * tw as usize * 4];
+        for x in 0..tw as usize {
+            let sx = (x as u64 * w as u64 / tw as u64) as usize;
+            let s = &src_row[sx * 4..sx * 4 + 4];
+            let d = &mut dst_row[x * 4..x * 4 + 4];
+            d.copy_from_slice(s);
+        }
+    }
+    out
 }
 
 // ===================== P2P 直连媒体通道（中继兜底） =====================
@@ -582,11 +637,11 @@ mod tests {
     fn make_encoder_falls_back_without_native_lib() {
         // 未配置 YUDUAN_ENCODER_LIB：原生编解码器回退 RAW_RGBA，JPEG 走透传。
         std::env::remove_var("YUDUAN_ENCODER_LIB");
-        let e = make_encoder(CODEC_H264);
+        let e = make_encoder(CODEC_H264, 640, 360);
         assert_eq!(e.codec(), CODEC_RAW_RGBA);
-        let j = make_encoder(CODEC_JPEG);
+        let j = make_encoder(CODEC_JPEG, 640, 360);
         assert_eq!(j.codec(), CODEC_JPEG);
-        let r = make_encoder(CODEC_RAW_RGBA);
+        let r = make_encoder(CODEC_RAW_RGBA, 640, 360);
         assert_eq!(r.codec(), CODEC_RAW_RGBA);
     }
 
@@ -594,10 +649,56 @@ mod tests {
     fn native_encoder_load_fails_gracefully() {
         // 未配置 / 文件不存在 → try_load 返回 None（不影响回退）。
         std::env::remove_var("YUDUAN_ENCODER_LIB");
-        assert!(NativeEncoder::try_load(CODEC_H264).is_none());
+        assert!(NativeEncoder::try_load(CODEC_H264, 640, 360).is_none());
         std::env::set_var("YUDUAN_ENCODER_LIB", "/no/such/encoder.lib");
-        assert!(NativeEncoder::try_load(CODEC_H265).is_none());
+        assert!(NativeEncoder::try_load(CODEC_H265, 640, 360).is_none());
         std::env::remove_var("YUDUAN_ENCODER_LIB");
+    }
+
+    #[test]
+    fn fit_dims_preserves_aspect_and_even() {
+        // 3584×2240 → min(1920/3584,1080/2240)=0.4821 → 1728×1080（保比、偶数）
+        assert_eq!(fit_dims(3584, 2240, 1920, 1080), (1728, 1080));
+        // 已小于上限：保持原尺寸（取偶）
+        assert_eq!(fit_dims(1280, 800, 1920, 1080), (1280, 800));
+        // 只缩不放：一边超限
+        assert_eq!(fit_dims(2560, 1080, 1920, 1080), (1920, 810));
+        // 奇数尺寸取偶
+        assert_eq!(fit_dims(641, 481, 0, 0), (640, 480));
+        // 极端比例
+        assert_eq!(fit_dims(3840, 2160, 1920, 1080), (1920, 1080));
+        assert_eq!(fit_dims(1000, 1000, 100, 500), (100, 100));
+        // 0 尺寸防御
+        assert_eq!(fit_dims(0, 0, 1920, 1080), (1, 1));
+    }
+
+    #[test]
+    fn downscale_rgba_nearest_neighbor() {
+        // 2×2 → 2×2（不变）
+        let src: Vec<u8> = vec![
+            1, 2, 3, 255, 4, 5, 6, 255,
+            7, 8, 9, 255, 10, 11, 12, 255,
+        ];
+        let out = downscale_rgba(&src, 2, 2, 2, 2);
+        assert_eq!(out, src);
+        // 4×4 → 2×2：取 (0,0) (2,0) (0,2) (2,2)
+        let mut src4 = vec![0u8; 4 * 4 * 4];
+        for y in 0..4 {
+            for x in 0..4 {
+                let v = (y * 4 + x) as u8;
+                src4[(y * 4 + x) * 4] = v;
+            }
+        }
+        let out2 = downscale_rgba(&src4, 4, 4, 2, 2);
+        assert_eq!(out2.len(), 2 * 2 * 4);
+        assert_eq!(out2[0], 0); // (0,0)
+        assert_eq!(out2[4], 2); // (2,0)
+        assert_eq!(out2[8], 8); // (0,2)
+        assert_eq!(out2[12], 10); // (2,2)
+        // 3×3 → 2×2（最近邻取样，长度正确即可，取样点实现相关）
+        let src3 = vec![9u8; 3 * 3 * 4];
+        let out3 = downscale_rgba(&src3, 3, 3, 2, 2);
+        assert_eq!(out3, vec![9u8; 2 * 2 * 4]);
     }
 
     #[test]

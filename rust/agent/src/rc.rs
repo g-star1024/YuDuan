@@ -253,6 +253,9 @@ static RC_SESSION: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None
 /// 主端选择了 p2p 传输：即使首跳 dial 失败也保持等待，候选地址（rc_offer/rc_candidate）
 /// 到达后逐个尝试，全部失败才维持中枢中继（ICE-lite 单侧监听模型：viewer 监听、agent 拨号）。
 static RC_WANT_P2P: AtomicBool = AtomicBool::new(false);
+/// 协商目标尺寸（§8.3.7 性能）：capabilities.max_w/h 与实际采集分辨率保比取偶的结果。
+/// RAW/原生路径按此降采样后送编码；原生编码器会话按同一尺寸创建（create(codec,w,h)）。
+static RC_TARGET: std::sync::Mutex<Option<(u32, u32)>> = std::sync::Mutex::new(None);
 
 // ===================== P2P / 二进制帧媒体环（§8.3 运行时接入） =====================
 
@@ -316,9 +319,15 @@ fn clamp_runtime_codec(want: u8, rgba_ok: bool, native_ok: bool) -> u8 {
     }
 }
 
-/// 原生编码器可用性探测：库已配置且能创建该编解码器句柄。
+/// 原生编码器可用性探测：库已配置且能创建该编解码器句柄（进程级缓存，含预热）。
 fn native_encoder_ok(codec: u8) -> bool {
-    crate::rc_media::is_native_codec(codec) && crate::rc_media::NativeEncoder::try_load(codec).is_some()
+    crate::rc_media::is_native_codec(codec) && crate::rc_media::native_probe_cached(codec)
+}
+
+/// 协商目标尺寸：capabilities.max_w/h 与实际采集分辨率保比取偶。
+/// 未探测到采集分辨率时返回 None（帧循环按原尺寸发送）。
+fn target_dims() -> Option<(u32, u32)> {
+    *RC_TARGET.lock().unwrap()
 }
 
 /// 处理 rc_select（主端协商结果，§8.3）：
@@ -340,8 +349,8 @@ pub fn handle_rc_select(
     let transport = p.get("transport").and_then(|v| v.as_str()).unwrap_or("relay");
     let media_addr = p.get("media_addr").and_then(|v| v.as_str()).unwrap_or("");
 
-    // 能力探测（各一次）：RGBA 采集源 + 原生编码器库
-    let rgba_ok = rgba_capture_ok();
+    // 能力探测（各一次）：RGBA 采集源（顺带定协商目标尺寸）+ 原生编码器库
+    let rgba_ok = probe_rgba_set_target();
     let native_ok = native_encoder_ok(want_codec);
     let codec = clamp_runtime_codec(want_codec, rgba_ok, native_ok);
     if codec != want_codec {
@@ -360,6 +369,13 @@ pub fn handle_rc_select(
             false,
         );
     }
+    let (tw, th) = target_dims().unwrap_or((0, 0));
+    if tw > 0 {
+        eprintln!(
+            "[agent] 协商目标分辨率 {}x{}（capabilities 上限内保比取偶）",
+            tw, th
+        );
+    }
 
     RC_WANT_P2P.store(transport == "p2p" && !media_addr.is_empty(), Ordering::SeqCst);
 
@@ -372,7 +388,7 @@ pub fn handle_rc_select(
                     media_addr,
                     crate::rc_media::codec_name(codec)
                 );
-                channel = Some(MediaChannel::P2p { stream, codec, encoder: make_encoder(codec) });
+                channel = Some(MediaChannel::P2p { stream, codec, encoder: make_encoder(codec, tw, th) });
             }
             Err(e) => {
                 eprintln!("[agent] P2P 首跳直连失败({})，等待 ICE-lite 候选/回退中枢中继", e);
@@ -381,7 +397,7 @@ pub fn handle_rc_select(
     }
     let via_p2p = channel.is_some();
     if channel.is_none() {
-        channel = Some(MediaChannel::Relay { codec, encoder: make_encoder(codec) });
+        channel = Some(MediaChannel::Relay { codec, encoder: make_encoder(codec, tw, th) });
     }
     *RC_MEDIA.lock().unwrap() = channel;
 
@@ -413,13 +429,14 @@ fn try_candidate(
     match crate::rc_media::dial_direct(candidate) {
         Ok(stream) => {
             let codec = current_codec();
+            let (tw, th) = target_dims().unwrap_or((0, 0));
             eprintln!(
                 "[agent] P2P 候选直连成功 {} codec={}",
                 candidate,
                 crate::rc_media::codec_name(codec)
             );
             *RC_MEDIA.lock().unwrap() =
-                Some(MediaChannel::P2p { stream, codec, encoder: make_encoder(codec) });
+                Some(MediaChannel::P2p { stream, codec, encoder: make_encoder(codec, tw, th) });
             send_rc_event(
                 writer,
                 rng,
@@ -556,6 +573,7 @@ pub fn start_rc(writer: Writer, rng: Arc<Mutex<crate::Lcg>>, seq: Arc<Mutex<u64>
     let gen = RC_GEN.fetch_add(1, Ordering::SeqCst) + 1; // 新会话代次（旧帧线程随之失效）
     RC_WANT_P2P.store(false, Ordering::SeqCst);
     *RC_MEDIA.lock().unwrap() = None; // 新会话重新协商媒体通道
+    *RC_TARGET.lock().unwrap() = None; // 新会话重新探测目标分辨率
     *RC_SESSION.lock().unwrap() = Some(session_id.clone());
 
     // 合规：本地通知 + 事件（员工知情可拒绝；开发态自动授权见 rc_event）
@@ -594,6 +612,18 @@ pub fn start_rc(writer: Writer, rng: Arc<Mutex<crate::Lcg>>, seq: Arc<Mutex<u64>
                         }, false, false);
                     break;
                 }
+            };
+            // 性能（§8.3.7）：RAW/原生路径按协商目标分辨率降采样（JPEG 工具链路径保持原样）。
+            let (data, w, h) = if raw_mode {
+                match target_dims() {
+                    Some((tw, th)) if tw > 0 && (tw as usize != w || th as usize != h) => {
+                        let scaled = crate::rc_media::downscale_rgba(&data, w as u32, h as u32, tw, th);
+                        (scaled, tw as usize, th as usize)
+                    }
+                    _ => (data, w, h),
+                }
+            } else {
+                (data, w, h)
             };
             // 二进制媒体环（§8.3）：已协商通道 → 按协商 codec 编码采集帧 → 二进制帧。
             match send_media_frame(&writer, &data, w, h, frame_seq, started.elapsed().as_millis() as u32) {
@@ -1298,6 +1328,27 @@ pub fn capture_rgba() -> Option<(Vec<u8>, usize, usize)> {
 /// RGBA 采集可用性探测（协商期调用一次；做一次真实采集后丢弃）。
 pub fn rgba_capture_ok() -> bool {
     capture_rgba().is_some()
+}
+
+/// 协商期探测：一次真实 RGBA 采集 → 依 capabilities.max_w/h 定目标分辨率（保比取偶）
+/// 并写入 RC_TARGET；同时返回 RGBA 采集是否可用。
+fn probe_rgba_set_target() -> bool {
+    let caps = crate::rc_media::default_capabilities();
+    match capture_rgba() {
+        Some((_, w, h)) => {
+            let fit = crate::rc_media::fit_dims(w as u32, h as u32, caps.max_w as u32, caps.max_h as u32);
+            eprintln!(
+                "[agent] RGBA 采集可用 {}x{} → 协商目标 {}x{}",
+                w, h, fit.0, fit.1
+            );
+            *RC_TARGET.lock().unwrap() = Some(fit);
+            true
+        }
+        None => {
+            *RC_TARGET.lock().unwrap() = None;
+            false
+        }
+    }
 }
 
 // ===================== 屏幕采集 =====================

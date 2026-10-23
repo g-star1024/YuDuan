@@ -31,6 +31,8 @@ const (
 	frameHeaderLen = 24
 	codecJPEG      = 1
 	codecRawRGBA   = 0
+	codecH264      = 2
+	codecH265      = 3
 )
 
 var codecNames = []string{"raw_rgba", "jpeg", "h264", "h265", "vp8", "vp9", "av1"}
@@ -220,6 +222,13 @@ func main() {
 		if got == 0 {
 			started = time.Now()
 			logf("首帧头 8 字节: % x（%s 帧用于校验编码器输出特征）", payload[:min(8, len(payload))], codecName(codecGot))
+			// 首帧 = 关键帧：H.264 首段应为 SPS(7)，HEVC 应为 VPS(32)
+			if int(codecGot) == codecH264 || int(codecGot) == codecH265 {
+				if err := checkAnnexB(payload, codecGot); err != nil {
+					fatal("首帧 Annex-B/参数集校验失败: %v", err)
+				}
+				logf("首帧 Annex-B 校验通过（起始码 + 参数集在位）")
+			}
 		}
 		got++
 		totalBytes += len(payload)
@@ -267,6 +276,11 @@ func checkFrame(b []byte, wantCodec int) (byte, int, int, []byte, error) {
 	}
 	if codec == codecJPEG && (len(payload) < 2 || payload[0] != 0xFF || payload[1] != 0xD8) {
 		return 0, 0, 0, nil, errors.New("JPEG 载荷缺 SOI 标记")
+	}
+	if int(codec) == codecH264 || int(codec) == codecH265 {
+		if err := checkAnnexB(payload, 0); err != nil {
+			return 0, 0, 0, nil, fmt.Errorf("%s 载荷非合法 Annex-B: %v", codecNames[codec], err)
+		}
 	}
 	if codec == codecRawRGBA {
 		if w == 0 || h == 0 {
@@ -366,6 +380,57 @@ func lastToken(s string) string {
 		return ""
 	}
 	return f[len(f)-1]
+}
+
+// checkAnnexB 校验 H.264/H.265 裸流：Annex-B 起始码切分 NAL，逐段非空，
+// 且首 NAL 类型符合关键帧要求（H.264 首段应为 SPS(type 7)；HEVC 应为 VPS(type 32)）。
+func checkAnnexB(p []byte, codec byte) error {
+	if len(p) < 5 {
+		return errors.New("载荷过短")
+	}
+	var sc0 int
+	if p[0] == 0 && p[1] == 0 && p[2] == 0 && p[3] == 1 {
+		sc0 = 4
+	} else if p[0] == 0 && p[1] == 0 && p[2] == 1 {
+		sc0 = 3
+	} else {
+		return errors.New("缺起始码 00 00 00 01")
+	}
+	type seg struct{ start, end int }
+	var segs []seg
+	prev := sc0
+	for i := sc0; i+2 < len(p); i++ { // 从首起始码之后开始扫（避免把 4 字节起始码内部的 00 00 01 误判为新起始码）
+		if p[i] == 0 && p[i+1] == 0 && p[i+2] == 1 {
+			startLen := 3
+			end := i
+			if p[i-1] == 0 { // 4 字节起始码 00 00 00 01
+				end--
+				startLen = 4
+			}
+			if end <= prev {
+				return fmt.Errorf("偏移 %d 处空 NAL", prev)
+			}
+			segs = append(segs, seg{prev, end})
+			prev = i + startLen
+			i += startLen - 1
+		}
+	}
+	if len(p) <= prev {
+		return errors.New("末尾空 NAL")
+	}
+	segs = append(segs, seg{prev, len(p)})
+	if len(segs) == 0 {
+		return errors.New("无 NAL")
+	}
+	// 首 NAL 类型
+	head := p[segs[0].start]
+	switch {
+	case codec == codecH264 && head&0x1F != 7:
+		return fmt.Errorf("首 NAL 类型 %d 非 SPS(7)（关键帧应携带参数集）", head&0x1F)
+	case codec == codecH265 && (head>>1)&0x3F != 32:
+		return fmt.Errorf("首 NAL 类型 %d 非 VPS(32)（关键帧应携带参数集）", (head>>1)&0x3F)
+	}
+	return nil
 }
 
 func payloadOK(env proto.Envelope) any {
