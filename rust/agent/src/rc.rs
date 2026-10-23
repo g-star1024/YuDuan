@@ -1466,7 +1466,31 @@ fn probe_rgba_set_target() -> bool {
 
 // ===================== 屏幕采集 =====================
 
+/// JPEG 路径（§8.3.10 降采样）：优先 RGBA 采集（三平台同构，CoreGraphics/X11/GDI）
+/// → 按协商目标分辨率降采样 → 内置 JPEG 编码；RGBA 采集不可用时回退平台 CLI
+/// （screencapture/scrot/import，保持全分辨率兜底）。
+/// 效果：5K 屏 JPEG 从 2.3MB/帧（全分辨率）降至 1080p ~200KB 级，且不再依赖 CLI。
 fn capture_jpeg() -> Option<(Vec<u8>, usize, usize)> {
+    if let Some((rgba, w, h)) = capture_rgba() {
+        let (tw, th) = target_dims()
+            .map(|(a, b)| (a as usize, b as usize))
+            .unwrap_or((w, h));
+        let (data, tw, th) = if (tw, th) != (w, h) && tw > 0 && th > 0 {
+            (crate::rc_media::downscale_rgba(&rgba, w as u32, h as u32, tw as u32, th as u32), tw, th)
+        } else {
+            (rgba, w, h)
+        };
+        if let Some(jpeg) = crate::jpegenc::encode_rgba(&data, tw as u32, th as u32, 80) {
+            return Some((jpeg, tw, th));
+        }
+        // 编码失败：落 CLI 兜底（不产出错误码流）
+        eprintln!("[agent] 内置 JPEG 编码失败，回退平台 CLI 采集");
+    }
+    capture_jpeg_cli()
+}
+
+/// 平台 CLI 采集（旧路径，全分辨率兜底）。
+fn capture_jpeg_cli() -> Option<(Vec<u8>, usize, usize)> {
     let path = format!("/tmp/yuduan_rc_{}.jpg", std::process::id());
     if cfg!(target_os = "macos") {
         let ok = Command::new("screencapture")

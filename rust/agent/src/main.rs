@@ -37,6 +37,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 mod ed25519;
 mod httpget;
+mod jpegenc;
 mod rc;
 mod rc_media;
 mod secure;
