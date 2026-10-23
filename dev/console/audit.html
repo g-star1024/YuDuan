@@ -33,8 +33,12 @@
   <main>
     <div style="display:flex;justify-content:space-between;align-items:center;">
       <h2 style="font-size:15px;margin:12px 0;">操作审计（最近 200 条）</h2>
-      <button id="refreshBtn">刷新</button>
+      <div>
+        <button id="verifyBtn">校验审计链（WORM）</button>
+        <button id="refreshBtn">刷新</button>
+      </div>
     </div>
+    <div id="chainMsg" style="font-size:13px;margin:8px 0;min-height:18px;"></div>
     <div id="tbl"><div class="empty">加载中…</div></div>
   </main>
   <script src="auth.js"></script>
@@ -54,6 +58,18 @@
         ? `<table><thead><tr><th>时间</th><th>操作人</th><th>动作</th><th>对象</th><th>摘要</th><th>结果</th></tr></thead><tbody>${rows}</tbody></table>`
         : '<div class="empty">暂无审计记录</div>';
     }
+    document.getElementById('verifyBtn').onclick = async () => {
+      const el = document.getElementById('chainMsg');
+      el.textContent = '校验中…'; el.style.color = '#6b7280';
+      const j = await api('/api/v1/audit/verify');
+      if (j.valid) {
+        el.style.color = '#16a34a';
+        el.textContent = `审计链完整：已校验 ${j.checked} 条记录，哈希链无断裂`;
+      } else {
+        el.style.color = '#dc2626';
+        el.textContent = `审计链异常：${j.reason || '未知'}（first_bad_id=${j.first_bad_id}）`;
+      }
+    };
     document.getElementById('refreshBtn').onclick = load;
     load();
   </script>

@@ -42,6 +42,9 @@ type User struct {
 	Role        string `json:"role"`
 	Password    string `json:"-"` // 仅存储摘要
 	Disabled    bool   `json:"disabled"`
+	// MustChangePW 为 true 时，登录后仅允许调用改密接口，其余一律 403。
+	MustChangePW bool   `json:"must_change_password"`
+	Source       string `json:"source"` // local=本地账号 / directory=目录同步
 }
 
 // UserStore 账号持久化接口；内存与 PostgreSQL 两种实现都遵循它。
@@ -70,18 +73,98 @@ func NewAuthService(store UserStore, secret, pepper string) *AuthService {
 	return &AuthService{store: store, secret: secret, pepper: pepper}
 }
 
+// LoginResult 登录成功后的会话信息。
+type LoginResult struct {
+	Token             string
+	Role              string
+	MustChangePassword bool
+}
+
 // Login 校验口令并签发会话令牌（24h 有效）。
-func (s *AuthService) Login(username, password string) (string, error) {
+// 旧格式口令（无盐 HMAC）在验证通过后透明升级为 argon2id。
+func (s *AuthService) Login(username, password string) (*LoginResult, error) {
 	u, ok := s.store.GetUserByName(username)
 	if !ok || u.Disabled {
-		return "", fmtError("invalid credentials")
+		return nil, fmtError("invalid credentials")
 	}
-	want := crypto.HashPassword(password, s.pepper)
-	if !hmacEqual(want, u.Password) {
-		return "", fmtError("invalid credentials")
+	if !crypto.VerifyPassword(password, s.pepper, u.Password) {
+		return nil, fmtError("invalid credentials")
+	}
+	if crypto.NeedsRehash(u.Password) {
+		if upgraded := crypto.HashPassword(password, s.pepper); upgraded != "" {
+			u.Password = upgraded
+			s.store.UpsertUser(u)
+		}
 	}
 	exp := time.Now().Add(24 * time.Hour).Unix()
-	return crypto.SignToken(s.secret, u.Username, u.Role, exp), nil
+	token := crypto.SignToken(s.secret, u.Username, u.Role, exp, u.MustChangePW)
+	return &LoginResult{Token: token, Role: u.Role, MustChangePassword: u.MustChangePW}, nil
+}
+
+// ChangePassword 用户自助改密：校验旧口令、执行强度策略、清除改密标记。
+func (s *AuthService) ChangePassword(username, oldPassword, newPassword string) error {
+	if err := ValidatePasswordStrength(newPassword); err != nil {
+		return err
+	}
+	u, ok := s.store.GetUserByName(username)
+	if !ok || u.Disabled {
+		return fmtError("user not found")
+	}
+	if !crypto.VerifyPassword(oldPassword, s.pepper, u.Password) {
+		return fmtError("invalid old password")
+	}
+	if oldPassword == newPassword {
+		return fmtError("new password must differ from old")
+	}
+	hash := crypto.HashPassword(newPassword, s.pepper)
+	if hash == "" {
+		return fmtError("password hashing failed")
+	}
+	u.Password = hash
+	u.MustChangePW = false
+	s.store.UpsertUser(u)
+	return nil
+}
+
+// ForcePasswordChange 由 admin 对指定账号设置强制改密（下次登录即生效）。
+func (s *AuthService) ForcePasswordChange(username string) error {
+	u, ok := s.store.GetUserByName(username)
+	if !ok {
+		return fmtError("user not found")
+	}
+	u.MustChangePW = true
+	s.store.UpsertUser(u)
+	return nil
+}
+
+// ValidatePasswordStrength 口令强度策略：≥10 位，且包含大写、小写、数字三类中的至少两类。
+func ValidatePasswordStrength(pw string) error {
+	if len([]rune(pw)) < 10 {
+		return fmtError("password too short: at least 10 characters required")
+	}
+	var upper, lower, digit, other bool
+	for _, r := range pw {
+		switch {
+		case r >= 'A' && r <= 'Z':
+			upper = true
+		case r >= 'a' && r <= 'z':
+			lower = true
+		case r >= '0' && r <= '9':
+			digit = true
+		default:
+			other = true
+		}
+	}
+	classes := 0
+	for _, ok := range []bool{upper, lower, digit, other} {
+		if ok {
+			classes++
+		}
+	}
+	if classes < 3 {
+		return fmtError("password too weak: need at least 3 of upper/lower/digit/symbol")
+	}
+	return nil
 }
 
 // VerifyToken 校验并返回声明。
@@ -109,19 +192,6 @@ func fmtError(s string) error { return &authErr{s} }
 type authErr struct{ m string }
 
 func (e *authErr) Error() string { return e.m }
-
-// hmacEqual 恒定时间比较两摘要。
-func hmacEqual(a, b string) bool {
-	la, lb := len(a), len(b)
-	if la != lb {
-		return false
-	}
-	var diff byte
-	for i := 0; i < la; i++ {
-		diff |= a[i] ^ b[i]
-	}
-	return diff == 0
-}
 
 // TokenFromHeader 从 Authorization: Bearer <token> 中提取令牌。
 func TokenFromHeader(authz string) string {

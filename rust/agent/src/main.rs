@@ -1,22 +1,43 @@
-// 御端（YuDuan）终端统一管理平台 —— 生产副端（Rust 版，单文件，std-only）。
+// 御端（YuDuan）终端统一管理平台 —— 生产副端（Rust 版，std-only）。
 //
 // 硬约束：本机无法访问网络，只能使用 Rust 标准库（std），无任何第三方依赖。
 // 离线编译：rustc -O src/main.rs -o target/agent
+// 单元测试：rustc --test src/main.rs -o /tmp/agent_test && /tmp/agent_test
 //
-// 对接 Go 中枢明文 WebSocket：ws://127.0.0.1:8080/ws/agent （可用 YUDUAN_HUB 覆盖）。
+// 模块划分（安全基座与 M4/M5 能力均为纯 std 实现）：
+//   sha256.rs  SHA-256 / HMAC-SHA256 / base64 / 恒定时间比较（FIPS 180-4、RFC 4231 向量验证）
+//   secure.rs  指令 HMAC 验签 + nonce 防重放 + 时间窗（铁律 4，与 Go 中枢规范串逐字节一致）
+//   httpget.rs 极简 HTTP/1.1 GET（软件分发下载，Content-Length/chunked）
+//   swdist.rs  M5 软件分发安装（macOS pkg/zip/dmg、Linux deb/rpm/sh、Windows msi/exe）
+//   rc.rs      M4 远程控制（screencapture 采集 + CoreGraphics FFI 输入注入 + 合规远端提示）
+//
+// 传输：
+//   ws://  直连 TCP（明文，仅限受信局域网/开发调试）
+//   wss:// 经 openssl s_client 子进程管道代理做 TLS（std 无 TLS；见 WsClient::connect）
+// 环境变量：
+//   YUDUAN_HUB          中枢地址，默认 ws://127.0.0.1:8080/ws/agent（支持 wss://）
+//   YUDUAN_HMAC_SECRET  指令验签密钥；为空 = 开发态放行（与 Go 中枢 YUDUAN_HMAC_SECRET 一致才启用）
+//   YUDUAN_TLS_CAFILE   可选：wss 证书校验 CA（设置后启用严格校验；缺省接受自签名，限局域网）
+//
 // 控制面协议：JSON 信封（payload 为内嵌对象）——见 dev/proto/protocol.md 与 dev/internal/proto/proto.go。
 
 use std::io::{BufReader, Read, Write};
 use std::net::TcpStream;
-use std::process::Command;
+use std::process::{Child, Command};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+mod httpget;
+mod rc;
+mod secure;
+mod sha256;
+mod swdist;
+
 // ===================== 极简 JSON 解析（无 serde，纯 std） =====================
 
 #[derive(Debug, Clone)]
-enum Json {
+pub enum Json {
     Null,
     Bool(bool),
     Num(f64),
@@ -48,12 +69,6 @@ impl Json {
         match self {
             Json::Num(n) => Some(*n as i64),
             Json::Bool(b) => Some(if *b { 1 } else { 0 }),
-            _ => None,
-        }
-    }
-    fn as_f64(&self) -> Option<f64> {
-        match self {
-            Json::Num(n) => Some(*n),
             _ => None,
         }
     }
@@ -291,7 +306,7 @@ fn utf8_len(first: u8) -> usize {
     }
 }
 
-fn parse_json(b: &[u8]) -> Result<Json, String> {
+pub fn parse_json(b: &[u8]) -> Result<Json, String> {
     let mut p = Parser::new(b);
     let v = p.parse()?;
     Ok(v)
@@ -317,7 +332,7 @@ fn json_escape(s: &str) -> String {
     out
 }
 
-fn json_string(s: &str) -> String {
+pub fn json_string(s: &str) -> String {
     format!("\"{}\"", json_escape(s))
 }
 
@@ -325,7 +340,7 @@ fn json_string(s: &str) -> String {
 
 const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-fn base64_encode(input: &[u8]) -> String {
+pub fn base64_encode(input: &[u8]) -> String {
     let mut out = String::new();
     let mut i = 0;
     while i + 3 <= input.len() {
@@ -355,7 +370,7 @@ fn base64_encode(input: &[u8]) -> String {
 
 // ===================== 随机数（非密码学，仅用于掩码与 key / msg_id） =====================
 
-struct Lcg {
+pub struct Lcg {
     state: u64,
 }
 
@@ -674,40 +689,108 @@ fn collect_assets() -> Assets {
     }
 }
 
-// ===================== WebSocket 客户端（手写，std-only） =====================
+// ===================== WebSocket 客户端（ws:// 明文 / wss:// openssl 管道，std-only） =====================
+
+/// 读侧：ws:// 为 TcpStream，wss:// 为 openssl s_client 的 stdout 管道。
+type WsReader = BufReader<Box<dyn Read + Send>>;
+/// 写侧：对应写入 TcpStream 或 openssl stdin 管道。
+type WsWriter = Arc<Mutex<Box<dyn Write + Send>>>;
 
 struct WsClient {
-    reader: BufReader<TcpStream>,
-    writer: Arc<Mutex<TcpStream>>,
+    reader: WsReader,
+    writer: WsWriter,
+    /// wss 模式下保活 openssl 子进程；WsClient  drop（会话结束/重连）时 kill，避免残留管道进程。
+    tls_child: Option<Child>,
+}
+
+impl Drop for WsClient {
+    fn drop(&mut self) {
+        if let Some(c) = &mut self.tls_child {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
 }
 
 #[derive(Debug)]
 enum Frame {
     Text(Vec<u8>),
-    Ping(Vec<u8>),
-    Pong,
     Close,
 }
 
 impl WsClient {
     fn connect(url: &str) -> std::io::Result<WsClient> {
-        // 解析 ws://host:port/path
-        let rest = url
-            .strip_prefix("ws://")
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "only ws:// supported"))?;
+        // 解析 ws:// 或 wss://，取 authority 与 path
+        let (rest, default_port, is_tls) = if let Some(r) = url.strip_prefix("wss://") {
+            (r, 443u16, true)
+        } else if let Some(r) = url.strip_prefix("ws://") {
+            (r, 80u16, false)
+        } else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "only ws:// or wss:// supported",
+            ));
+        };
         let (authority, path) = match rest.find('/') {
             Some(idx) => (rest[..idx].to_string(), rest[idx..].to_string()),
             None => (rest.to_string(), "/".to_string()),
         };
-        let host = if authority.contains(':') {
-            authority.clone()
-        } else {
-            format!("{}:80", authority)
+        let (sni_host, port) = match authority.find(':') {
+            Some(i) => (
+                authority[..i].to_string(),
+                authority[i + 1..]
+                    .parse::<u16>()
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?,
+            ),
+            None => (authority.clone(), default_port),
         };
+        let addr = format!("{}:{}", sni_host, port);
 
-        let stream = TcpStream::connect(&host)?;
-        stream.set_read_timeout(None)?;
-        stream.set_write_timeout(None)?;
+        // 传输层：ws:// 直连 TCP；wss:// 以 openssl s_client 子进程做 TLS 管道代理。
+        // （std 无 TLS 实现；openssl 为系统常驻二进制，符合零第三方依赖约束。）
+        let (reader_box, mut writer_box, child): (Box<dyn Read + Send>, Box<dyn Write + Send>, Option<Child>) =
+            if is_tls {
+                let mut cmd = Command::new("openssl");
+                cmd.arg("s_client")
+                    .arg("-connect")
+                    .arg(&addr)
+                    .arg("-servername")
+                    .arg(&sni_host)
+                    .arg("-quiet")
+                    .arg("-ign_eof"); // stdin EOF 不自动断开，由本进程生命周期管理
+                // 配置了 CA 才做严格校验；缺省接受自签名（仅限受信局域网，生产应配置 CA 并固定证书）
+                if let Ok(cafile) = std::env::var("YUDUAN_TLS_CAFILE") {
+                    if !cafile.is_empty() {
+                        cmd.arg("-CAfile").arg(&cafile).arg("-verify_return_error");
+                    }
+                }
+                let mut c = cmd
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::inherit())
+                    .spawn()
+                    .map_err(|e| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            format!("spawn openssl failed: {} (wss 需要系统 openssl)", e),
+                        )
+                    })?;
+                let sin = c
+                    .stdin
+                    .take()
+                    .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "openssl stdin pipe"))?;
+                let sout = c
+                    .stdout
+                    .take()
+                    .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "openssl stdout pipe"))?;
+                (Box::new(sout), Box::new(sin), Some(c))
+            } else {
+                let stream = TcpStream::connect(&addr)?;
+                stream.set_read_timeout(None)?;
+                stream.set_write_timeout(None)?;
+                let w = stream.try_clone()?;
+                (Box::new(stream), Box::new(w), None)
+            };
 
         // 随机 Sec-WebSocket-Key = base64(16 字节)（握手用，非密码学即可）
         let key = base64_encode(&Lcg::new().bytes(16));
@@ -715,12 +798,11 @@ impl WsClient {
         let handshake = format!(
             "GET {path} HTTP/1.1\r\nHost: {authority}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
         );
-        let mut write_stream = stream.try_clone()?;
-        write_stream.write_all(handshake.as_bytes())?;
-        write_stream.flush()?;
+        writer_box.write_all(handshake.as_bytes())?;
+        writer_box.flush()?;
 
         // 读取 101 响应头直至空行
-        let mut reader = BufReader::new(stream);
+        let mut reader = BufReader::new(reader_box);
         let mut header = Vec::new();
         let mut byte = [0u8; 1];
         loop {
@@ -746,39 +828,14 @@ impl WsClient {
 
         Ok(WsClient {
             reader,
-            writer: Arc::new(Mutex::new(write_stream)),
+            writer: Arc::new(Mutex::new(writer_box)),
+            tls_child: child,
         })
     }
 
     // 发送掩码文本帧（客户端必须加掩码）
     fn send_text(&self, data: &[u8]) -> std::io::Result<()> {
-        let mut w = self.writer.lock().unwrap();
-        let len = data.len();
-        let mut header = Vec::with_capacity(10);
-        let mask_bit = 0x80u8;
-        if len < 126 {
-            header.push(0x81);
-            header.push((len as u8) | mask_bit);
-        } else if len <= 0xffff {
-            header.push(0x81);
-            header.push(126 | mask_bit);
-            header.extend_from_slice(&(len as u16).to_be_bytes());
-        } else {
-            header.push(0x81);
-            header.push(127 | mask_bit);
-            header.extend_from_slice(&(len as u64).to_be_bytes());
-        }
-        // 掩码用本地 LCG：避免与心跳/指令线程的「先 rng 后 writer」加锁顺序形成环（防死锁）。
-        let mask = Lcg::new().bytes(4);
-        header.extend_from_slice(&mask);
-        w.write_all(&header)?;
-        let mut masked = Vec::with_capacity(len);
-        for (i, &b) in data.iter().enumerate() {
-            masked.push(b ^ mask[i % 4]);
-        }
-        w.write_all(&masked)?;
-        w.flush()?;
-        Ok(())
+        send_ws_text(&mut *self.writer.lock().unwrap(), data)
     }
 
     fn send_pong(&self, payload: &[u8]) -> std::io::Result<()> {
@@ -862,7 +919,7 @@ fn build_envelope(
 ) -> String {
     *seq += 1;
     let key = rng.bytes(9);
-    let msg_id = format!("rust-{}", hex_encode(&key));
+    let msg_id = format!("rust-{}", sha256::hex_encode(&key));
     format!(
         "{{\"ver\":1,\"msg_id\":{},\"ts\":{},\"type\":{},\"seq\":{},\"payload\":{},\"sig\":\"\"}}",
         json_string(&msg_id),
@@ -873,19 +930,11 @@ fn build_envelope(
     )
 }
 
-fn hex_encode(b: &[u8]) -> String {
-    let mut s = String::new();
-    for &x in b {
-        s.push_str(&format!("{:02x}", x));
-    }
-    s
-}
-
 // ===================== 指令处理 =====================
 
 fn handle_command(
     env: &Json,
-    writer: Arc<Mutex<TcpStream>>,
+    writer: WsWriter,
     rng: Arc<Mutex<Lcg>>,
     seq: Arc<Mutex<u64>>,
     _device_id: Arc<Mutex<String>>,
@@ -903,11 +952,14 @@ fn handle_command(
         let (state, exit_code, output_log) = match action.as_str() {
             "shell" => run_shell(&command),
             "collect" => run_collect(),
-            "sw_install" => (
-                "success".to_string(),
-                0,
-                "rust agent: sw_install 暂未实现(需引入 crate/FFI)".to_string(),
-            ),
+            "sw_install" => {
+                // M5 软件分发：下载安装包并按平台静默安装（swdist.rs）
+                let url = payload.get("software_url").and_then(|v| v.as_str()).unwrap_or("");
+                let platform = payload.get("platform").and_then(|v| v.as_str()).unwrap_or("");
+                let pkg = payload.get("pkg_name").and_then(|v| v.as_str()).unwrap_or("");
+                let o = swdist::handle_sw_install(url, platform, pkg);
+                (o.state, o.exit_code, o.output_log)
+            }
             other => (
                 "failed".to_string(),
                 1,
@@ -925,7 +977,9 @@ fn handle_command(
         let mut rng_g = rng.lock().unwrap();
         let mut seq_g = seq.lock().unwrap();
         let msg = build_envelope(&mut rng_g, &mut seq_g, "result", &payload_obj);
-        if let Err(e) = writer.lock().unwrap().write_and_send(&msg) {
+        drop(rng_g);
+        drop(seq_g);
+        if let Err(e) = send_ws_text(&mut *writer.lock().unwrap(), msg.as_bytes()) {
             eprintln!("[agent] 发送 result 失败: {}", e);
         } else {
             eprintln!("[agent] 已回 result task={} state={}", task_id, state);
@@ -933,44 +987,37 @@ fn handle_command(
     });
 }
 
-// 给 TcpStream 加一个便捷“自动加掩码发送文本”的方法，通过 WsClient 不行（这里仅持有裸 stream），
-// 因此我们用一个独立函数：持有 writer 锁后直接构造掩码帧。
-trait WriteWsText {
-    fn write_and_send(&mut self, text: &str) -> std::io::Result<()>;
-}
-
-impl WriteWsText for TcpStream {
-    fn write_and_send(&mut self, text: &str) -> std::io::Result<()> {
-        // 注意：此处掩码需要共享 rng，但为简化，使用基于时间/地址的临时随机掩码。
-        // 掩码值不影响安全性（仅防缓存污染），非密码学即可。
-        let mut rng = Lcg::new();
-        let data = text.as_bytes();
-        let len = data.len();
-        let mask = rng.bytes(4);
-        let mut header = Vec::with_capacity(10);
-        let mask_bit = 0x80u8;
-        if len < 126 {
-            header.push(0x81);
-            header.push((len as u8) | mask_bit);
-        } else if len <= 0xffff {
-            header.push(0x81);
-            header.push(126 | mask_bit);
-            header.extend_from_slice(&(len as u16).to_be_bytes());
-        } else {
-            header.push(0x81);
-            header.push(127 | mask_bit);
-            header.extend_from_slice(&(len as u64).to_be_bytes());
-        }
-        header.extend_from_slice(&mask);
-        self.write_all(&header)?;
-        let mut masked = Vec::with_capacity(len);
-        for (i, &b) in data.iter().enumerate() {
-            masked.push(b ^ mask[i % 4]);
-        }
-        self.write_all(&masked)?;
-        self.flush()?;
-        Ok(())
+// 发送一个掩码文本帧（客户端必须加掩码）。
+// 写成自由函数而非 trait：写侧在 ws:// 下是 TcpStream、wss:// 下是 openssl stdin 管道，
+// 经 Box<dyn Write + Send> 统一收敛，心跳 / 指令回执 / 远控帧线程共用同一出口。
+// 掩码用本地 LCG：避免与心跳/指令线程的「先 rng 后 writer」加锁顺序形成环（防死锁）；
+// 掩码值不影响安全性（仅防缓存污染），非密码学即可。
+fn send_ws_text<W: Write + ?Sized>(w: &mut W, data: &[u8]) -> std::io::Result<()> {
+    let len = data.len();
+    let mut header = Vec::with_capacity(10);
+    let mask_bit = 0x80u8;
+    if len < 126 {
+        header.push(0x81);
+        header.push((len as u8) | mask_bit);
+    } else if len <= 0xffff {
+        header.push(0x81);
+        header.push(126 | mask_bit);
+        header.extend_from_slice(&(len as u16).to_be_bytes());
+    } else {
+        header.push(0x81);
+        header.push(127 | mask_bit);
+        header.extend_from_slice(&(len as u64).to_be_bytes());
     }
+    let mask = Lcg::new().bytes(4);
+    header.extend_from_slice(&mask);
+    w.write_all(&header)?;
+    let mut masked = Vec::with_capacity(len);
+    for (i, &b) in data.iter().enumerate() {
+        masked.push(b ^ mask[i % 4]);
+    }
+    w.write_all(&masked)?;
+    w.flush()?;
+    Ok(())
 }
 
 fn run_shell(command: &str) -> (String, i64, String) {
@@ -1035,9 +1082,17 @@ fn build_heartbeat(load: f64, ip: &str) -> String {
 }
 
 fn session(url: &str) -> std::io::Result<()> {
+    // 安全基座：指令验签密钥（与 Go 中枢 YUDUAN_HMAC_SECRET 一致才启用；为空 = 开发态放行）
+    let hmac_secret = std::env::var("YUDUAN_HMAC_SECRET").unwrap_or_default();
+    let nonce_guard = Arc::new(secure::NonceGuard::new(8192));
+
     let rng = Arc::new(Mutex::new(Lcg::new()));
     let ws = WsClient::connect(url)?;
-    eprintln!("[agent] WebSocket 握手成功: {}", url);
+    eprintln!(
+        "[agent] WebSocket 握手成功: {}（验签 {}）",
+        url,
+        if hmac_secret.is_empty() { "未启用（开发态）" } else { "已启用" }
+    );
 
     // 共享状态
     let device_id: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
@@ -1076,7 +1131,9 @@ fn session(url: &str) -> std::io::Result<()> {
                 let mut rng_g = rng.lock().unwrap();
                 let mut seq_g = seq.lock().unwrap();
                 let msg = build_envelope(&mut rng_g, &mut seq_g, "heartbeat", &hb);
-                if let Err(e) = writer.lock().unwrap().write_and_send(&msg) {
+                drop(rng_g);
+                drop(seq_g);
+                if let Err(e) = send_ws_text(&mut *writer.lock().unwrap(), msg.as_bytes()) {
                     eprintln!("[agent] 心跳发送失败: {}", e);
                     break;
                 } else {
@@ -1095,8 +1152,6 @@ fn session(url: &str) -> std::io::Result<()> {
                 eprintln!("[agent] 收到 close 帧，断开");
                 return Err(std::io::Error::new(std::io::ErrorKind::ConnectionAborted, "closed"));
             }
-            Frame::Ping(_) => continue,
-            Frame::Pong => continue,
             Frame::Text(data) => {
                 let parsed = parse_json(&data);
                 let env = match parsed {
@@ -1132,6 +1187,43 @@ fn session(url: &str) -> std::io::Result<()> {
                             eprintln!("[agent] 收到 command 但尚未注册（忽略）");
                             continue;
                         }
+                        // 安全基座：HMAC 验签 + nonce 防重放（与 Go 参考副端同语义：
+                        // 密钥未配置 = 开发态放行；配置后验签失败/重放一律拒绝并回执 failed）
+                        let frame = String::from_utf8_lossy(&data).to_string();
+                        match secure::verify_command(&hmac_secret, &frame, &env, &nonce_guard) {
+                            secure::VerifyOutcome::Ok | secure::VerifyOutcome::NoSecret => {}
+                            outcome => {
+                                let reason = match outcome {
+                                    secure::VerifyOutcome::BadSignature => "HMAC 验签失败",
+                                    secure::VerifyOutcome::Replayed => "nonce 重放被拒",
+                                    secure::VerifyOutcome::TimeSkew => "时间窗超限",
+                                    secure::VerifyOutcome::Malformed => "信封字段缺失/无法解析",
+                                    _ => "验签失败",
+                                };
+                                eprintln!("[agent] 拒绝执行指令: {}", reason);
+                                // 回执 failed（任务快速失败，不静默丢弃），与 Go 副端行为一致
+                                let tid = env
+                                    .get("payload")
+                                    .and_then(|p| p.get("task_id"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                let payload_obj = format!(
+                                    "{{\"task_id\":{},\"state\":\"failed\",\"exit_code\":-1,\"output_log\":{}}}",
+                                    json_string(&tid),
+                                    json_string(&format!("rust agent: 指令被拒（{}）", reason))
+                                );
+                                let msg = {
+                                    let mut rng_g = rng.lock().unwrap();
+                                    let mut seq_g = seq.lock().unwrap();
+                                    build_envelope(&mut rng_g, &mut seq_g, "result", &payload_obj)
+                                };
+                                if let Err(e) = send_ws_text(&mut *ws.writer.lock().unwrap(), msg.as_bytes()) {
+                                    eprintln!("[agent] 发送拒绝回执失败: {}", e);
+                                }
+                                continue;
+                            }
+                        }
                         handle_command(
                             &env,
                             ws.writer.clone(),
@@ -1140,8 +1232,29 @@ fn session(url: &str) -> std::io::Result<()> {
                             device_id.clone(),
                         );
                     }
+                    // M4 远控：请求会话（合规提示 + rc_ready + 帧循环）
+                    "rc_request" => {
+                        if let Some(p) = env.get("payload") {
+                            let sid = p.get("session_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                            let did = device_id.lock().unwrap().clone();
+                            eprintln!("[agent] rc 请求 session={} device={}", sid, did);
+                            rc::start_rc(ws.writer.clone(), rng.clone(), seq.clone(), sid, did);
+                        }
+                    }
+                    // M4 远控：键鼠输入注入
+                    "rc_input" => {
+                        if let Some(p) = env.get("payload") {
+                            let sid = p.get("session_id").and_then(|v| v.as_str()).unwrap_or("");
+                            rc::apply_input(&ws.writer.clone(), &rng, &seq, sid, p);
+                        }
+                    }
+                    // M4 远控：结束会话
+                    "rc_stop" => {
+                        eprintln!("[agent] rc 会话结束指令");
+                        rc::stop_rc();
+                    }
                     _ => {
-                        // 其它类型（rc_* 等）直接忽略，不崩溃
+                        // 其它类型优雅忽略，不崩溃
                         eprintln!("[agent] 忽略未知/不相关消息类型: {}", msg_type);
                     }
                 }
@@ -1153,6 +1266,15 @@ fn session(url: &str) -> std::io::Result<()> {
 fn main() {
     let url = std::env::var("YUDUAN_HUB").unwrap_or_else(|_| "ws://127.0.0.1:8080/ws/agent".to_string());
     eprintln!("[agent] 御端 Rust 副端启动，目标中枢: {}", url);
+    eprintln!(
+        "[agent] 配置: 验签密钥={} (YUDUAN_HMAC_SECRET{})",
+        if std::env::var("YUDUAN_HMAC_SECRET").map(|v| !v.is_empty()).unwrap_or(false) {
+            "已配置"
+        } else {
+            "未配置（开发态放行）"
+        },
+        if url.starts_with("wss://") { "，TLS: openssl s_client 管道" } else { "" }
+    );
     loop {
         match session(&url) {
             Ok(_) => {}

@@ -58,17 +58,23 @@ func (m *MemUserStore) Count() int {
 // SeedDefaultAdmin 写入演示用默认账号。
 // admin 始终确保存在（若缺失则补建，不覆盖已存在的 admin，例如目录同步/人工改密后），
 // 以保证任何情况下都有可登录的超管入口；operator/viewer 仅在账号库为空时播种。
-// 生产环境首次部署应强制改密或通过目录同步注入。
-func SeedDefaultAdmin(us auth.UserStore, pepper string) {
+// adminMustChangePW 为 true 时，内置 admin 首次登录必须先改密（生产默认开启，
+// 由 YUDUAN_ADMIN_MUST_CHANGE_PW 环境变量控制，开发联调可关）。
+func SeedDefaultAdmin(us auth.UserStore, pepper string, adminMustChangePW bool) {
+	// 先判定账号库是否为空（再补建 admin），否则 admin 落库后计数永不为 0，
+	// operator/viewer 将永远不会被播种。
+	empty := us.Count() == 0
 	if _, ok := us.GetUserByName("admin"); !ok {
 		us.UpsertUser(auth.User{
-			Username:    "admin",
-			DisplayName: "内置管理员",
-			Role:        auth.RoleAdmin,
-			Password:    crypto.HashPassword("admin123", pepper),
+			Username:     "admin",
+			DisplayName:  "内置管理员",
+			Role:         auth.RoleAdmin,
+			Password:     crypto.HashPassword("admin123", pepper),
+			MustChangePW: adminMustChangePW,
+			Source:       "local",
 		})
 	}
-	if us.Count() > 0 {
+	if !empty {
 		return
 	}
 	us.UpsertUser(auth.User{
@@ -76,11 +82,13 @@ func SeedDefaultAdmin(us auth.UserStore, pepper string) {
 		DisplayName: "运维操作员",
 		Role:        auth.RoleOperator,
 		Password:    crypto.HashPassword("operator123", pepper),
+		Source:      "local",
 	})
 	us.UpsertUser(auth.User{
 		Username:    "viewer",
 		DisplayName: "只读访客",
 		Role:        auth.RoleViewer,
 		Password:    crypto.HashPassword("viewer123", pepper),
+		Source:      "local",
 	})
 }

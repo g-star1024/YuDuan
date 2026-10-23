@@ -54,7 +54,12 @@
           localStorage.setItem('yd_token', j.token);
           localStorage.setItem('yd_role', j.role);
           localStorage.setItem('yd_user', u);
-          location.href = 'index.html';
+          if (j.must_change_password) {
+            // 强制改密：仅放行改密页
+            location.href = 'change-password.html?forced=1';
+          } else {
+            location.href = 'index.html';
+          }
         } else {
           msg.textContent = j.message || '登录失败';
         }

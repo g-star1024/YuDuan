@@ -9,6 +9,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -47,6 +48,8 @@ type HubConfig struct {
 	HMACSecret  string
 	HMACEnforce bool
 	DirSync     *directory.SyncEngine
+	HubID       string // 多中枢部署时的节点标识（缺省 hub-<hostname>）
+	PublicAddr  string // 节点对外地址（/api/v1/hubs 展示用）
 }
 
 // Hub 是中枢核心结构。
@@ -65,6 +68,10 @@ type Hub struct {
 	sessions map[string]*RCSession // deviceID -> 远控会话
 	software map[string]*proto.SoftwareItem
 	repoDir  string
+
+	hubID      string
+	publicAddr string
+	bus        *CommandBus // 非 nil 时指令走多中枢总线（去粘性）
 }
 
 // NewHub 构造中枢，缺省回退到内存实现。
@@ -85,19 +92,26 @@ func NewHub(cfg HubConfig) *Hub {
 		cfg.Auth = auth.NewAuthService(cfg.Users, cfg.HMACSecret, "")
 	}
 	_ = os.MkdirAll(cfg.RepoDir, 0o755)
+	hubID := cfg.HubID
+	if hubID == "" {
+		host, _ := os.Hostname()
+		hubID = "hub-" + host
+	}
 	return &Hub{
-		store:    cfg.Store,
-		auditor:  cfg.Auditor,
-		users:    cfg.Users,
-		authSvc:  cfg.Auth,
-		secret:   cfg.HMACSecret,
-		enforce:  cfg.HMACEnforce,
-		dirSync:  cfg.DirSync,
-		conns:    make(map[string]*ws.Conn),
-		pending:  make(map[string]chan proto.ResultPayload),
-		sessions: make(map[string]*RCSession),
-		software: make(map[string]*proto.SoftwareItem),
-		repoDir:  cfg.RepoDir,
+		store:      cfg.Store,
+		auditor:    cfg.Auditor,
+		users:      cfg.Users,
+		authSvc:    cfg.Auth,
+		secret:     cfg.HMACSecret,
+		enforce:    cfg.HMACEnforce,
+		dirSync:    cfg.DirSync,
+		conns:      make(map[string]*ws.Conn),
+		pending:    make(map[string]chan proto.ResultPayload),
+		sessions:   make(map[string]*RCSession),
+		software:   make(map[string]*proto.SoftwareItem),
+		repoDir:    cfg.RepoDir,
+		hubID:      hubID,
+		publicAddr: cfg.PublicAddr,
 	}
 }
 
@@ -108,6 +122,8 @@ func (h *Hub) Handler() http.Handler {
 	mux.HandleFunc("/ws/viewer", h.handleViewerWS)
 	// 公开
 	mux.HandleFunc("/api/v1/login", h.handleLogin)
+	// 受保护：自助改密（仅需登录；must_change 账户的唯一放行接口）
+	mux.HandleFunc("/api/v1/password", h.guardAuthOnly(h.handleChangePassword))
 	// 受保护：资产
 	mux.HandleFunc("/api/v1/devices", h.guard(auth.PermDeviceView, h.handleDevices))
 	mux.HandleFunc("/api/v1/report", h.guard(auth.PermDeviceView, h.handleReport))
@@ -117,12 +133,19 @@ func (h *Hub) Handler() http.Handler {
 	mux.HandleFunc("/api/v1/repo/", h.handleRepo) // 副端下载（演示放开；生产应短令牌/鉴权）
 	// 受保护：审计 / 目录同步
 	mux.HandleFunc("/api/v1/audit", h.guard(auth.PermAuditView, h.handleAudit))
+	mux.HandleFunc("/api/v1/audit/verify", h.guard(auth.PermAuditView, h.handleAuditVerify))
 	mux.HandleFunc("/api/v1/dirsync", h.guard(auth.PermDirSync, h.handleDirSync))
+	// 受保护：账号管理（admin）
+	mux.HandleFunc("/api/v1/admin/users", h.guard(auth.PermUserManage, h.handleAdminUsers))
+	mux.HandleFunc("/api/v1/admin/users/", h.guard(auth.PermUserManage, h.handleAdminUserAction))
+	// 受保护：多中枢节点视图（admin）
+	mux.HandleFunc("/api/v1/hubs", h.guard(auth.PermUserManage, h.handleHubs))
 	mux.HandleFunc("/", h.handleConsole)
 	return mux
 }
 
 // guard 包裹受保护接口：校验 Bearer 令牌并判定角色权限。
+// 携带 must_change 标记的令牌除改密接口外一律 403（强制改密）。
 func (h *Hub) guard(perm string, fn func(http.ResponseWriter, *http.Request, crypto.Claims)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		claims, err := h.authSvc.VerifyToken(auth.TokenFromHeader(r.Header.Get("Authorization")))
@@ -130,8 +153,24 @@ func (h *Hub) guard(perm string, fn func(http.ResponseWriter, *http.Request, cry
 			writeErr(w, 401, "unauthorized")
 			return
 		}
+		if claims.MustChange {
+			writeErr(w, 4033, "password_change_required")
+			return
+		}
 		if !h.authSvc.HasPerm(claims.Role, perm) {
 			writeErr(w, 403, "forbidden: 需要权限 "+perm)
+			return
+		}
+		fn(w, r, claims)
+	}
+}
+
+// guardAuthOnly 仅校验令牌有效性（不做权限/改密判定），供自助改密接口使用。
+func (h *Hub) guardAuthOnly(fn func(http.ResponseWriter, *http.Request, crypto.Claims)) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		claims, err := h.authSvc.VerifyToken(auth.TokenFromHeader(r.Header.Get("Authorization")))
+		if err != nil {
+			writeErr(w, 401, "unauthorized")
 			return
 		}
 		fn(w, r, claims)
@@ -208,15 +247,93 @@ func (h *Hub) handleLogin(w http.ResponseWriter, r *http.Request) {
 		Password string `json:"password"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&body)
-	token, err := h.authSvc.Login(body.Username, body.Password)
+	res, err := h.authSvc.Login(body.Username, body.Password)
 	if err != nil {
 		h.audit(body.Username, "login", "", "登录失败", "failed")
 		writeErr(w, 401, "invalid credentials")
 		return
 	}
-	claims, _ := h.authSvc.VerifyToken(token)
-	h.audit(body.Username, "login", "", "角色="+claims.Role, "success")
-	writeJSON(w, map[string]any{"code": 0, "token": token, "role": claims.Role})
+	h.audit(body.Username, "login", "", "角色="+res.Role, "success")
+	writeJSON(w, map[string]any{"code": 0, "token": res.Token, "role": res.Role, "must_change_password": res.MustChangePassword})
+}
+
+// handleChangePassword 自助改密：校验旧口令 + 强度策略；成功后清除 must_change 标记。
+func (h *Hub) handleChangePassword(w http.ResponseWriter, r *http.Request, claims crypto.Claims) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var body struct {
+		OldPassword string `json:"old_password"`
+		NewPassword string `json:"new_password"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	if err := h.authSvc.ChangePassword(claims.Username, body.OldPassword, body.NewPassword); err != nil {
+		h.audit(claims.Username, "password_change", claims.Username, "改密失败: "+err.Error(), "failed")
+		writeErr(w, 4002, err.Error())
+		return
+	}
+	h.audit(claims.Username, "password_change", claims.Username, "改密成功", "success")
+	// 签发新令牌（must_change 已清除），前端无缝续用
+	res, err := h.authSvc.Login(claims.Username, body.NewPassword)
+	if err != nil {
+		writeJSON(w, map[string]any{"code": 0, "message": "password changed"})
+		return
+	}
+	writeJSON(w, map[string]any{"code": 0, "token": res.Token, "role": res.Role})
+}
+
+// handleAdminUsers 账号列表（admin）。
+func (h *Hub) handleAdminUsers(w http.ResponseWriter, r *http.Request, _ crypto.Claims) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	writeJSON(w, map[string]any{"total": h.users.Count(), "users": h.users.ListUsers()})
+}
+
+// handleAdminUserAction 账号级管理动作（admin）：
+//   POST /api/v1/admin/users/{name}/force-password-change  强制改密
+//   POST /api/v1/admin/users/{name}/disable                禁用
+//   POST /api/v1/admin/users/{name}/enable                 启用
+func (h *Hub) handleAdminUserAction(w http.ResponseWriter, r *http.Request, claims crypto.Claims) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	rest := strings.TrimPrefix(r.URL.Path, "/api/v1/admin/users/")
+	parts := strings.Split(rest, "/")
+	if len(parts) != 2 || parts[0] == "" {
+		writeErr(w, 4001, "usage: /api/v1/admin/users/{name}/{force-password-change|disable|enable}")
+		return
+	}
+	name, action := parts[0], parts[1]
+	u, ok := h.users.GetUserByName(name)
+	if !ok {
+		writeErr(w, 4004, "user not found")
+		return
+	}
+	switch action {
+	case "force-password-change":
+		if err := h.authSvc.ForcePasswordChange(name); err != nil {
+			writeErr(w, 4004, err.Error())
+			return
+		}
+		h.audit(claims.Username, "force_pw_change", name, "管理员设置强制改密", "success")
+		writeJSON(w, map[string]any{"code": 0, "message": "ok"})
+	case "disable":
+		u.Disabled = true
+		h.users.UpsertUser(u)
+		h.audit(claims.Username, "user_disable", name, "管理员禁用账号", "success")
+		writeJSON(w, map[string]any{"code": 0, "message": "ok"})
+	case "enable":
+		u.Disabled = false
+		h.users.UpsertUser(u)
+		h.audit(claims.Username, "user_enable", name, "管理员启用账号", "success")
+		writeJSON(w, map[string]any{"code": 0, "message": "ok"})
+	default:
+		writeErr(w, 4001, "unknown action: "+action)
+	}
 }
 
 // ---- Agent 长连接 ----
@@ -423,13 +540,11 @@ func (h *Hub) handleDeviceCmd(w http.ResponseWriter, r *http.Request, claims cry
 	}
 	_ = json.NewDecoder(r.Body).Decode(&body)
 
-	h.mu.Lock()
-	conn, ok := h.conns[id]
-	h.mu.Unlock()
-	if !ok {
-		writeErr(w, 2001, "device offline")
-		return
+	timeout := 15 * time.Second
+	if body.Action == "sw_install" {
+		timeout = 120 * time.Second
 	}
+
 	taskID := newTaskID()
 	cmd, _ := proto.NewEnvelope(proto.TypeCommand, 0, proto.CommandPayload{
 		Action: body.Action, TaskID: taskID, Command: body.Command,
@@ -437,12 +552,39 @@ func (h *Hub) handleDeviceCmd(w http.ResponseWriter, r *http.Request, claims cry
 	})
 	h.sign(&cmd) // 安全基座：关键指令 HMAC 签名
 	cmdBytes, _ := json.Marshal(cmd)
-	if err := conn.WriteMessage(cmdBytes); err != nil {
-		writeErr(w, 2001, "send failed: "+err.Error())
+
+	auditDetail := "action=" + body.Action + " cmd=" + body.Command
+	var res proto.ResultPayload
+	var err error
+	if h.bus != nil {
+		// 多中枢总线：落 outbox → 本地认领或跨实例执行（去粘性）
+		res, err = h.bus.Dispatch(id, taskID, cmdBytes, timeout)
+	} else {
+		// 单实例（内存模式）：本地直发
+		h.mu.Lock()
+		conn, ok := h.conns[id]
+		h.mu.Unlock()
+		if !ok {
+			writeErr(w, 2001, "device offline")
+			return
+		}
+		if err = conn.WriteMessage(cmdBytes); err != nil {
+			writeErr(w, 2001, "send failed: "+err.Error())
+			return
+		}
+		res, err = h.awaitTaskResult(taskID, timeout)
+	}
+	if err != nil {
+		h.audit(claims.Username, "command", id, auditDetail, "failed")
+		writeErr(w, 2001, err.Error())
 		return
 	}
-	h.audit(claims.Username, "command", id, "action="+body.Action+" cmd="+body.Command, "success")
+	h.audit(claims.Username, "command", id, auditDetail, "success")
+	writeJSON(w, res)
+}
 
+// awaitTaskResult 注册 taskID 等待通道并阻塞至回执或超时。
+func (h *Hub) awaitTaskResult(taskID string, timeout time.Duration) (proto.ResultPayload, error) {
 	ch := make(chan proto.ResultPayload, 1)
 	h.mu.Lock()
 	h.pending[taskID] = ch
@@ -452,17 +594,52 @@ func (h *Hub) handleDeviceCmd(w http.ResponseWriter, r *http.Request, claims cry
 		delete(h.pending, taskID)
 		h.mu.Unlock()
 	}()
-
-	timeout := 15 * time.Second
-	if body.Action == "sw_install" {
-		timeout = 120 * time.Second
-	}
 	select {
 	case res := <-ch:
-		writeJSON(w, res)
+		return res, nil
 	case <-time.After(timeout):
-		writeErr(w, 2001, "command timeout")
+		return proto.ResultPayload{}, fmt.Errorf("command timeout")
 	}
+}
+
+// deviceOnlineLocal 判断设备是否长连接在本实例。
+func (h *Hub) deviceOnlineLocal(id string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	_, ok := h.conns[id]
+	return ok
+}
+
+// sendToDevice 经本实例长连接下发原始信封。
+func (h *Hub) sendToDevice(id string, envBytes []byte) bool {
+	h.mu.Lock()
+	conn, ok := h.conns[id]
+	h.mu.Unlock()
+	if !ok {
+		return false
+	}
+	return conn.WriteMessage(envBytes) == nil
+}
+
+// localDeviceIDs 返回本实例在线设备 ID 列表（总线认领用）。
+func (h *Hub) localDeviceIDs() []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	ids := make([]string, 0, len(h.conns))
+	for id := range h.conns {
+		ids = append(ids, id)
+	}
+	return ids
+}
+
+// handleHubs 多中枢节点视图（集群心跳）。
+func (h *Hub) handleHubs(w http.ResponseWriter, r *http.Request, _ crypto.Claims) {
+	if h.bus == nil {
+		writeJSON(w, map[string]any{"total": 0, "hubs": []HubNode{}, "note": "bus disabled (memory mode)"})
+		return
+	}
+	nodes := h.bus.Nodes()
+	writeJSON(w, map[string]any{"total": len(nodes), "hubs": nodes, "self": h.hubID})
 }
 
 func (h *Hub) handleSoftwareList(w http.ResponseWriter, r *http.Request, _ crypto.Claims) {
@@ -556,6 +733,17 @@ func (h *Hub) handleAudit(w http.ResponseWriter, r *http.Request, _ crypto.Claim
 	writeJSON(w, map[string]any{"total": h.auditor.AuditCount(), "events": h.auditor.Query(limit)})
 }
 
+// handleAuditVerify 重放审计哈希链，返回 WORM 完整性结论。
+func (h *Hub) handleAuditVerify(w http.ResponseWriter, r *http.Request, _ crypto.Claims) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	rep := h.auditor.VerifyChain()
+	h.audit("system", "audit_verify", "", fmt.Sprintf("chain valid=%v checked=%d", rep.Valid, rep.Checked), "success")
+	writeJSON(w, rep)
+}
+
 func (h *Hub) handleDirSync(w http.ResponseWriter, r *http.Request, claims crypto.Claims) {
 	res, err := h.RunDirSync(claims.Username)
 	if err != nil {
@@ -573,6 +761,8 @@ func (h *Hub) handleConsole(w http.ResponseWriter, r *http.Request) {
 		http.ServeFile(w, r, "console/index.html")
 	case "/login.html":
 		http.ServeFile(w, r, "console/login.html")
+	case "/change-password.html":
+		http.ServeFile(w, r, "console/change-password.html")
 	case "/audit.html":
 		http.ServeFile(w, r, "console/audit.html")
 	case "/rc.html":
@@ -660,18 +850,26 @@ func itoa(n int) string {
 }
 
 func atoi(s string) (int, error) {
-	n := 0
+	n, err := atoi64(s)
+	return int(n), err
+}
+
+func atoi64(s string) (int64, error) {
+	n := int64(0)
 	neg := false
 	i := 0
 	if i < len(s) && (s[i] == '-' || s[i] == '+') {
 		neg = s[i] == '-'
 		i++
 	}
+	if i == len(s) {
+		return 0, jsonError("not a number")
+	}
 	for ; i < len(s); i++ {
 		if s[i] < '0' || s[i] > '9' {
 			return 0, jsonError("not a number")
 		}
-		n = n*10 + int(s[i]-'0')
+		n = n*10 + int64(s[i]-'0')
 	}
 	if neg {
 		n = -n

@@ -42,10 +42,10 @@ Hub 重启不丢设备台账、账号、审计；副端通过令牌在重连后�
 - **无状态扩容**：Hub 不持有跨实例必需的内存态；设备在线态、待回执任务为实例内短时状态，实例重建即恢复。
 - **健康检查**：`GET /api/v1/report`（需令牌）或新增 `GET /healthz`（免鉴权，仅探活）作为 LB 健康检查端点。
 
-### 2.2 指令路由的跨实例问题（已知限制 & 演进）
-- 当前 `handleDeviceCmd` 只能把指令发给**本实例**持有的该设备长连接。多实例下，若指令落到非设备所在实例，会返回 `device offline`。
-- **局域网 MVP 缓解**：控制台 REST 与 Agent 长连接走**同一 Hub 实例**（同域 sticky），运维规模（数百–一千终端）单实例可承载，先以「主实例 + 热备」运行。
-- **P2 演进**：引入实例间总线（Redis Pub/Sub 或 PG `LISTEN/NOTIFY`）做指令转发，或改为「指令经 PG 排队、设备所在实例消费」模型，彻底去粘性。见技术文档 M6 演进节。
+### 2.2 指令路由的跨实例问题（已实现：PG outbox 去粘性）
+- **当前实现**：多 Hub 实例共享 PostgreSQL 时，指令先落 `cmd_outbox` 表（`hub.Dispatch`），由**持有该设备长连接的任意实例**以 `UPDATE ... WHERE id IN (SELECT ... FOR UPDATE SKIP LOCKED LIMIT 32) RETURNING` 认领执行；NOTIFY（专用 listener 连接）+ 300ms 轮询双兜底；`hub_nodes` 5s 心跳登记节点，`GET /api/v1/hubs` 可观测。实测：hub-a 下发 → 设备连在 hub-b → 跨实例执行成功（`dev/e2e_pg.py`）。
+- **长连接仍粘在单实例**（WebSocket 是有连接状态协议，粘性不可避免），但**指令不再粘**——控制台 REST 可落到任意实例。
+- 局域网 MVP 亦可单实例运行（无 DSN 时总线不启用，本地直发）。
 
 ### 2.3 滚动升级
 - Hub 无状态 ⇒ 可蓝绿/滚动重启；LB 先摘流量 → 优雅关闭（`SIGTERM` 触发 `http.Server.Shutdown`，等待在途指令回执）→ 起新版本 → 恢复流量。
@@ -56,10 +56,10 @@ Hub 重启不丢设备台账、账号、审计；副端通过令牌在重连后�
 ## 3. 数据层高可用（PostgreSQL）
 
 - **主从流复制**：一主一从（同步或异步），从库可接管只读查询（报表）。故障时提升从库为主，Hub 通过 DSN/VIP 指向新主。
-- **连接与池化**：当前零依赖 `internal/pg` 为单连接简单查询；生产替换为 `pgx`/`lib/pq` + 连接池（`max_open_conns`、空闲回收、健康探测），并加查询超时。
+- **连接与池化**：`internal/pg` 已内置有界连接池（4 空闲 / 8 上限、sync.Cond 等待、坏连接 Discard）+ 扩展协议参数化查询（`$n` 占位，text 格式参数）；生产如需更完整能力可替换为 `pgx`/`lib/pq`，并加查询超时。
 - **备份**：每日 `pg_dump` 逻辑备份 + WAL 归档；保留 ≥ 30 天。设备台账/账号/审计均可由备份重建。
-- **Schema 迁移**：`PostgresStore.migrate()` 用 `CREATE TABLE IF NOT EXISTS` 幂等建表；生产引入版本化迁移（如 golang-migrate）管理增量 DDL。
-- **参数化查询**：现有内联转义 `q()` 仅适配演示；生产必须参数化，杜绝 SQL 注入（铁律 4）。
+- **Schema 迁移**：`PostgresStore.migrate()` 用 `CREATE TABLE IF NOT EXISTS` 幂等建表（多实例并发启动有目录竞态，总线 migrate 已加重试兜底）；生产引入版本化迁移（如 golang-migrate）管理增量 DDL。
+- **参数化查询**：已全量参数化（`QueryArgs`/`ExecArgs`），注入串实测安全落库/读出（`dev/e2e_pg.py`）。
 
 ---
 
@@ -119,5 +119,6 @@ Hub 重启不丢设备台账、账号、审计；副端通过令牌在重连后�
 
 ## 8. 本期落地边界（局域网 MVP）
 
-已实现并可验证：TLS、HMAC 签名/验签、RBAC、审计落库、PostgreSQL 持久化（重启不丢）、AD/LDAP 同步引擎、Rust 生产副端互通。
-留待 P2/生产化：多 Hub 实例总线、PG 连接池与参数化、argon2 口令、真实 AD bind、强制改密、WORM 审计、SCA。
+已实现并可验证：TLS、HMAC 签名/验签、RBAC、审计落库（WORM 哈希链 + PG 禁改删触发器 + 链校验端点）、PostgreSQL 持久化（重启不丢）+ 连接池/参数化查询、AD/LDAP 同步引擎（stdlib bind）、argon2id 口令 + 首次登录强制改密、多 Hub 指令总线（PG outbox 去粘性）、Rust 生产副端全能力（验签/sw_install/远控/wss/服务化脚本）。
+
+留待 P2/生产化：公网化 TLS（内网 CA / 证书固定 / mTLS / KMS）、P2P 直连远控 + H.264/H.265 二进制帧、Linux/Windows 输入注入、安装包签名校验、SCA 依赖扫描、副端防篡改加固。

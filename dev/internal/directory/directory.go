@@ -120,7 +120,9 @@ func NewSyncEngine(src DirectorySource, m RoleMapping, users auth.UserStore, pep
 }
 
 // Sync 拉取目录用户并按映射 upsert 为 RBAC 账号。
-// 同步账户的默认口令为 "Synced@2026"（演示用）；生产应改用目录认证（Kerberos/LDAP bind），见 HA/安全文档。
+// 新同步账户的默认口令为 "Synced@2026"（演示用）并标记必须改密；
+// 已存在账户仅更新资料与角色，保留其口令与改密状态（重复同步不会重置用户已改的口令）。
+// 生产应改用目录认证（LDAP bind/Kerberos），见 HA/安全文档。
 func (e *SyncEngine) Sync() (SyncResult, error) {
 	dirUsers, err := e.Source.ListUsers()
 	if err != nil {
@@ -135,13 +137,24 @@ func (e *SyncEngine) Sync() (SyncResult, error) {
 		}
 		role := e.Mapping.resolveRole(du.MemberOf)
 		roleSet[role] = true
-		pw := crypto.HashPassword("Synced@2026", e.Pepper)
-		e.Users.UpsertUser(auth.User{
-			Username:    du.Username,
-			DisplayName: du.DisplayName,
-			Role:        role,
-			Password:    pw,
-		})
+		existing, ok := e.Users.GetUserByName(du.Username)
+		if ok {
+			// 已存在：保留口令与改密状态，仅更新资料/角色
+			existing.DisplayName = du.DisplayName
+			existing.Role = role
+			existing.Source = "directory"
+			e.Users.UpsertUser(existing)
+		} else {
+			pw := crypto.HashPassword("Synced@2026", e.Pepper)
+			e.Users.UpsertUser(auth.User{
+				Username:     du.Username,
+				DisplayName:  du.DisplayName,
+				Role:         role,
+				Password:     pw,
+				MustChangePW: true,
+				Source:       "directory",
+			})
+		}
 		res.UsersSynced++
 	}
 	for r := range roleSet {

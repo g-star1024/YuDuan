@@ -45,9 +45,13 @@ func Nonce() string {
 	return hex.EncodeToString(b)
 }
 
-// SignToken 签发登录会话令牌（HMAC 绑定 username|role|exp）。
-func SignToken(secret, username, role string, exp int64) string {
-	body := fmt.Sprintf("%s|%s|%d", username, role, exp)
+// SignToken 签发登录会话令牌（HMAC 绑定 username|role|exp|mustChange）。
+func SignToken(secret, username, role string, exp int64, mustChange bool) string {
+	must := "0"
+	if mustChange {
+		must = "1"
+	}
+	body := fmt.Sprintf("%s|%s|%d|%s", username, role, exp, must)
 	mac := hmac.New(sha256.New, []byte(secret))
 	mac.Write([]byte(body))
 	return fmt.Sprintf("%s.%s", body, hex.EncodeToString(mac.Sum(nil)))
@@ -55,9 +59,10 @@ func SignToken(secret, username, role string, exp int64) string {
 
 // Claims 是解析后的令牌声明。
 type Claims struct {
-	Username string
-	Role     string
-	Exp      int64
+	Username   string
+	Role       string
+	Exp        int64
+	MustChange bool // 需强制改密：除改密接口外一律 403
 }
 
 // VerifyToken 校验登录令牌并返回声明；过期或签名错误返回 error。
@@ -73,10 +78,11 @@ func VerifyToken(secret, token string) (Claims, error) {
 		return Claims{}, fmt.Errorf("bad signature")
 	}
 	var c Claims
-	// body 固定格式 "username|role|exp"，手动按 '|' 拆分，避免 Go fmt 不支持 scanset 动词。
+	// body 固定格式 "username|role|exp|mustChange"，手动按 '|' 拆分，避免 Go fmt 不支持 scanset 动词。
+	// 兼容旧 3 段令牌（无 mustChange 字段时视为 false）。
 	fields := strings.Split(body, "|")
-	if len(fields) != 3 {
-		return Claims{}, fmt.Errorf("bad claims: expected 3 fields, got %d", len(fields))
+	if len(fields) != 3 && len(fields) != 4 {
+		return Claims{}, fmt.Errorf("bad claims: expected 3 or 4 fields, got %d", len(fields))
 	}
 	c.Username = fields[0]
 	c.Role = fields[1]
@@ -85,16 +91,13 @@ func VerifyToken(secret, token string) (Claims, error) {
 		return Claims{}, fmt.Errorf("bad claims: %v", err)
 	}
 	c.Exp = exp
+	if len(fields) == 4 {
+		c.MustChange = fields[3] == "1"
+	}
 	if time.Now().Unix() > exp {
 		return Claims{}, fmt.Errorf("token expired")
 	}
 	return c, nil
 }
 
-// HashPassword 为演示用口令摘要（SHA256 + 服务端 pepper），恒定时间比较。
-// 生产环境应替换为 argon2/bcrypt（见铁律 4 安全里程碑说明）。
-func HashPassword(password, pepper string) string {
-	mac := hmac.New(sha256.New, []byte(pepper))
-	mac.Write([]byte(password))
-	return hex.EncodeToString(mac.Sum(nil))
-}
+// HashPassword / VerifyPassword / NeedsRehash 见 password.go（argon2id）。

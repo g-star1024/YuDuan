@@ -104,15 +104,43 @@ build()
 hub = start_hub()
 time.sleep(1.5)
 
-# 1) 登录：admin / viewer（验证此前损坏的令牌往返）
+# 1) 登录：admin / viewer（验证令牌往返 + 强制改密门禁）
 st, body = http_post("/api/v1/login", {"username": "admin", "password": "admin123"})
 ADMIN_TOKEN = body.get("token")
 check("login admin 200+role", st == 200 and body.get("role") == "admin", f"role={body.get('role')}")
 check("login admin token 非空", bool(ADMIN_TOKEN))
+check("admin 首次登录标记强制改密", body.get("must_change_password") is True,
+      f"must_change={body.get('must_change_password')}")
+
+# 1b) 强制改密门禁：must_change 令牌访问受保护接口 → 4033；改密接口放行
+st, b = http_get("/api/v1/devices", token=ADMIN_TOKEN)
+check("must_change 令牌被 4033 拦截", b.get("code") == 4033, f"code={b.get('code')}")
+st, b = http_post("/api/v1/password", {"old_password": "admin123", "new_password": "weak"},
+                  token=ADMIN_TOKEN)
+check("弱口令改密被拒(强度校验)", b.get("code") == 4002, f"code={b.get('code')} msg={b.get('message','')[:40]}")
+st, b = http_post("/api/v1/password", {"old_password": "wrong-old", "new_password": "Admin@2026x"},
+                  token=ADMIN_TOKEN)
+check("旧口令错误改密被拒", b.get("code") == 4002, f"code={b.get('code')}")
+st, b = http_post("/api/v1/password", {"old_password": "admin123", "new_password": "Admin@2026x"},
+                  token=ADMIN_TOKEN)
+check("admin 改密成功并换发令牌", st == 200 and b.get("code") == 0 and bool(b.get("token")),
+      f"code={b.get('code')}")
+ADMIN_TOKEN = b.get("token") or ADMIN_TOKEN
+# 换发令牌不再带 must_change，可访问受保护接口
+st, b = http_get("/api/v1/devices", token=ADMIN_TOKEN)
+check("换发令牌可访问设备接口", b.get("total") is not None, f"total={b.get('total')}")
+# 旧口令失效、新口令可登（argon2id 口令生效）
+st, b = http_post("/api/v1/login", {"username": "admin", "password": "admin123"})
+check("旧口令登录被拒", b.get("code") == 401, f"code={b.get('code')}")
+st, b = http_post("/api/v1/login", {"username": "admin", "password": "Admin@2026x"})
+check("新口令登录成功", st == 200 and b.get("role") == "admin" and not b.get("must_change_password"),
+      f"role={b.get('role')} must_change={b.get('must_change_password')}")
+ADMIN_TOKEN = b.get("token") or ADMIN_TOKEN
 
 st, body = http_post("/api/v1/login", {"username": "viewer", "password": "viewer123"})
 VIEWER_TOKEN = body.get("token")
 check("login viewer role", st == 200 and body.get("role") == "viewer", f"role={body.get('role')}")
+check("viewer 无强制改密标记", body.get("must_change_password") is not True)
 
 st, body = http_post("/api/v1/login", {"username": "admin", "password": "wrong"})
 check("login 错误口令 401", st == 200 and body.get("code") == 401, f"code={body.get('code')}")
@@ -179,6 +207,33 @@ if dev2:
     check("HMAC 强制拒绝(错误secret) → 指令失败", isinstance(b, dict) and b.get("state") == "failed"
           and "HMAC" in b.get("output_log", ""), f"state={b.get('state')} out={b.get('output_log','')[:60]}")
 agent_bad.terminate()
+
+# 7) WORM 审计链校验（哈希链 replay 验证）
+st, b = http_get("/api/v1/audit/verify", token=ADMIN_TOKEN)
+check("审计链校验通过", isinstance(b, dict) and b.get("valid") is True,
+      f"valid={b.get('valid') if isinstance(b, dict) else None} checked={b.get('checked') if isinstance(b, dict) else None}")
+
+# 8) 账号管理：强制改密 / 禁用 / 启用（admin）
+st, b = http_post("/api/v1/admin/users/viewer/force-password-change", {}, token=ADMIN_TOKEN)
+check("admin 强制 viewer 改密", b.get("code") == 0, f"code={b.get('code')}")
+st, b = http_post("/api/v1/login", {"username": "viewer", "password": "viewer123"})
+check("被强制改密账户登录带标记", b.get("must_change_password") is True,
+      f"must_change={b.get('must_change_password')}")
+st, b = http_get("/api/v1/devices", token=b.get("token"))
+check("被强制改密账户被 4033 拦截", b.get("code") == 4033, f"code={b.get('code')}")
+st, b = http_post("/api/v1/admin/users/viewer/disable", {}, token=ADMIN_TOKEN)
+check("admin 禁用 viewer", b.get("code") == 0, f"code={b.get('code')}")
+st, b = http_post("/api/v1/login", {"username": "viewer", "password": "viewer123"})
+check("禁用账户登录被拒", b.get("code") == 401, f"code={b.get('code')}")
+st, b = http_post("/api/v1/admin/users/viewer/enable", {}, token=ADMIN_TOKEN)
+check("admin 重新启用 viewer", b.get("code") == 0, f"code={b.get('code')}")
+st, b = http_post("/api/v1/login", {"username": "viewer", "password": "viewer123"})
+check("重新启用后可登录", st == 200 and b.get("role") == "viewer", f"role={b.get('role')}")
+
+# 9) 多中枢节点视图（内存模式返回 bus disabled 说明）
+st, b = http_get("/api/v1/hubs", token=ADMIN_TOKEN)
+check("hubs 节点视图可访问", isinstance(b, dict) and ("hubs" in b or "note" in b),
+      f"keys={list(b.keys()) if isinstance(b, dict) else None}")
 
 # 收尾
 hub.terminate()

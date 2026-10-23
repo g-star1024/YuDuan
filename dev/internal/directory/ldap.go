@@ -1,14 +1,12 @@
-//go:build ldap
-
-// 此文件实现真实 AD/LDAP 目录源，依赖 github.com/go-ldap/ldap/v3。
-// 离线环境（当前受限）通过 `//go:build ldap` 排除编译；联网部署时：
-//   1) go get github.com/go-ldap/ldap/v3
-//   2) 去掉本文件首行 build tag 或 `go build -tags ldap ./...`
-// 同步引擎（SyncEngine）本身不依赖 LDAP，因此离线也可经 FileDirectory 完整验证。
+// 真实 AD/LDAP 目录源：经自研最小 LDAP 客户端（internal/ldap，纯标准库 BER 实现）
+// 完成 simple bind 认证与子树搜索，将域用户映射为御端 RBAC 账号。
+// 支持 ldap（明文，内网）与 ldaps（TLS）；过滤器语法子集见 internal/ldap。
 package directory
 
 import (
-	"github.com/go-ldap/ldap/v3"
+	"strings"
+
+	"yuduan/internal/ldap"
 )
 
 // LDAPConfig 是 AD/LDAP 连接配置。
@@ -16,6 +14,7 @@ type LDAPConfig struct {
 	Host     string
 	Port     int
 	UseTLS   bool
+	Insecure bool // ldaps 自签证书时跳过校验（内网）
 	BindDN   string
 	BindPwd  string
 	BaseDN   string
@@ -31,9 +30,16 @@ type LDAPDirectory struct {
 // NewLDAPDirectory 构造 LDAP 目录源。
 func NewLDAPDirectory(cfg LDAPConfig) *LDAPDirectory { return &LDAPDirectory{cfg: cfg} }
 
-// ListUsers 查询域内用户并映射为 DirUser。
+func (l *LDAPDirectory) dial() (*ldap.Conn, error) {
+	if l.cfg.UseTLS {
+		return ldap.DialTLS(l.cfg.Host, l.cfg.Port, l.cfg.Insecure)
+	}
+	return ldap.Dial(l.cfg.Host, l.cfg.Port)
+}
+
+// ListUsers 查询域内用户并映射为 DirUser（过滤禁用账户）。
 func (l *LDAPDirectory) ListUsers() ([]DirUser, error) {
-	conn, err := ldap.DialURL(ldapURL(l.cfg))
+	conn, err := l.dial()
 	if err != nil {
 		return nil, err
 	}
@@ -45,24 +51,25 @@ func (l *LDAPDirectory) ListUsers() ([]DirUser, error) {
 	if base == "" {
 		base = l.cfg.BaseDN
 	}
-	search := ldap.NewSearchRequest(base,
-		ldap.ScopeWholeSubtree, ldap.NeverDerefAliases, 0, 0, false,
-		"(&(objectClass=user)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))",
-		[]string{"sAMAccountName", "displayName", "mail", "memberOf"}, nil)
-	res, err := conn.Search(search)
+	entries, err := conn.Search(ldap.SearchRequest{
+		BaseDN: base,
+		Scope:  ldap.ScopeWholeSubtree,
+		Filter: "(&(objectClass=user)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))",
+		Attributes: []string{"sAMAccountName", "displayName", "mail", "memberOf"},
+	})
 	if err != nil {
 		return nil, err
 	}
-	out := make([]DirUser, 0, len(res.Entries))
-	for _, e := range res.Entries {
+	out := make([]DirUser, 0, len(entries))
+	for _, e := range entries {
 		memberOf := []string{}
-		for _, dn := range e.GetAttributeValues("memberOf") {
+		for _, dn := range e.Attributes["memberOf"] {
 			memberOf = append(memberOf, cnOf(dn))
 		}
 		out = append(out, DirUser{
-			Username:    e.GetAttributeValue("sAMAccountName"),
-			DisplayName: e.GetAttributeValue("displayName"),
-			Email:       e.GetAttributeValue("mail"),
+			Username:    e.Get("sAMAccountName"),
+			DisplayName: e.Get("displayName"),
+			Email:       e.Get("mail"),
 			MemberOf:    memberOf,
 		})
 	}
@@ -71,7 +78,7 @@ func (l *LDAPDirectory) ListUsers() ([]DirUser, error) {
 
 // ListGroups 查询域内组。
 func (l *LDAPDirectory) ListGroups() ([]DirGroup, error) {
-	conn, err := ldap.DialURL(ldapURL(l.cfg))
+	conn, err := l.dial()
 	if err != nil {
 		return nil, err
 	}
@@ -83,31 +90,24 @@ func (l *LDAPDirectory) ListGroups() ([]DirGroup, error) {
 	if base == "" {
 		base = l.cfg.BaseDN
 	}
-	search := ldap.NewSearchRequest(base, ldap.ScopeWholeSubtree, ldap.NeverDerefAliases, 0, 0, false,
-		"(objectClass=group)", []string{"cn"}, nil)
-	res, err := conn.Search(search)
+	entries, err := conn.Search(ldap.SearchRequest{
+		BaseDN: base, Scope: ldap.ScopeWholeSubtree, Filter: "(objectClass=group)",
+		Attributes: []string{"cn"},
+	})
 	if err != nil {
 		return nil, err
 	}
-	out := make([]DirGroup, 0, len(res.Entries))
-	for _, e := range res.Entries {
-		out = append(out, DirGroup{Name: e.GetAttributeValue("cn")})
+	out := make([]DirGroup, 0, len(entries))
+	for _, e := range entries {
+		out = append(out, DirGroup{Name: e.Get("cn")})
 	}
 	return out, nil
-}
-
-func ldapURL(c LDAPConfig) string {
-	scheme := "ldap"
-	if c.UseTLS {
-		scheme = "ldaps"
-	}
-	return scheme + "://" + c.Host + ":" + itoa(c.Port)
 }
 
 func cnOf(dn string) string {
 	// 取 DN 中第一个 CN= 组件
 	for i := 0; i < len(dn); i++ {
-		if i+3 <= len(dn) && dn[i:i+3] == "CN=" {
+		if i+3 <= len(dn) && strings.EqualFold(dn[i:i+3], "CN=") {
 			end := i + 3
 			for end < len(dn) && dn[end] != ',' {
 				end++
@@ -116,26 +116,4 @@ func cnOf(dn string) string {
 		}
 	}
 	return dn
-}
-
-func itoa(n int) string {
-	if n == 0 {
-		return "0"
-	}
-	neg := n < 0
-	if neg {
-		n = -n
-	}
-	buf := [12]byte{}
-	pos := len(buf)
-	for n > 0 {
-		pos--
-		buf[pos] = byte('0' + n%10)
-		n /= 10
-	}
-	if neg {
-		pos--
-		buf[pos] = '-'
-	}
-	return string(buf[pos:])
 }
