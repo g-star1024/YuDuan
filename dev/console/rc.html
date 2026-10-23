@@ -38,13 +38,19 @@
   <main>
     <div class="bar">
       <select id="deviceSel"><option value="">选择被控设备…</option></select>
+      <select id="codecSel" title="编解码器（来自被控端能力宣告；P2P 直连为主端能力，浏览器经中枢二进制中继）"></select>
       <button id="startBtn">发起远控</button>
+      <button id="renegoBtn" class="ghost" disabled>重新协商</button>
       <button id="stopBtn" class="ghost">结束会话</button>
       <span id="status" class="status"></span>
     </div>
     <div class="layout">
       <div class="screen"><canvas id="screen" width="1280" height="800"></canvas></div>
       <div class="side">
+        <div class="card">
+          <h3>媒体通道</h3>
+          <div id="stats" class="hint">—</div>
+        </div>
         <div class="card">
           <h3>操作提示</h3>
           <p class="hint">在画面内移动/点击鼠标、键入字符即向被控端发送输入。被控端会弹出远端提示，员工可拒绝。</p>
@@ -67,10 +73,89 @@
     const logEl = document.getElementById('log');
     const statusEl = document.getElementById('status');
 
+    // —— §8.3 二进制媒体帧（与 Rust rc_media 24B 小端头一致）——
+    const CODEC_NAMES = ['raw_rgba', 'jpeg', 'h264', 'h265', 'vp8', 'vp9', 'av1'];
+    const FRAME_MAGIC = 0x59445946;      // 'YDYF' 小端
+    const FRAME_HEADER_LEN = 24;
+    let mediaCodec = 1;                  // 当前协商编码（默认 jpeg）
+    let mediaTransport = 'relay';        // 浏览器无法监听裸 TCP：固定经中枢二进制中继
+    let frameTimes = [];                 // 近 5s 帧到达时刻（fps）
+    let byteWindow = [];                 // 近 1s 帧载荷（码率）
+
     function log(msg) {
       const t = new Date().toLocaleTimeString('zh-CN');
       logEl.textContent += `[${t}] ${msg}\n`;
       logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    // 收到被控端能力宣告：填充编解码器下拉，按浏览器偏好自动选（jpeg 优先，原生可渲染）。
+    function populateCodecs(codecs) {
+      const list = (codecs && codecs.length) ? codecs.slice() : [1];
+      const pref = [1, 0, 2, 3, 4, 5, 6];
+      const sel = document.getElementById('codecSel');
+      sel.innerHTML = list.map(c => `<option value="${c}">${CODEC_NAMES[c] || ('codec:' + c)}</option>`).join('');
+      const pick = pref.find(c => list.includes(c));
+      mediaCodec = (pick === undefined) ? list[0] : pick;
+      sel.value = String(mediaCodec);
+    }
+
+    // 发送协商结果（rc_select）：浏览器固定 transport=relay；P2P 直连由主端（Tauri）使用。
+    function sendSelect() {
+      if (!ws || !sessionID) return;
+      const codec = parseInt(document.getElementById('codecSel').value, 10) || mediaCodec;
+      mediaCodec = codec;
+      const env = { ver: 1, msg_id: 'm' + Date.now(), ts: Math.floor(Date.now() / 1000), type: 'rc_select', seq: 1,
+        payload: { session_id: sessionID, codec, transport: mediaTransport } };
+      ws.send(JSON.stringify(env));
+      log(`已发送协商：${CODEC_NAMES[codec] || codec} / ${mediaTransport}`);
+    }
+
+    // 二进制媒体帧统计（fps / 码率）。
+    function countFrame(bytes, codec) {
+      const now = Date.now();
+      frameTimes.push(now);
+      byteWindow.push({ t: now, b: bytes });
+      while (frameTimes.length && now - frameTimes[0] > 5000) frameTimes.shift();
+      while (byteWindow.length && now - byteWindow[0].t > 1000) byteWindow.shift();
+      const fps = (frameTimes.length / 5).toFixed(1);
+      const kbps = (byteWindow.reduce((s, x) => s + x.b, 0) / 1024).toFixed(0);
+      document.getElementById('stats').textContent =
+        `通道：${mediaTransport} · 编码：${CODEC_NAMES[codec] || codec} · 分辨率：${frameW}×${frameH} · ${fps} fps · ${kbps} KB/s`;
+    }
+
+    // 解析并渲染一帧二进制媒体帧（§8.3：24B 小端头 + payload）。
+    function renderBinaryFrame(buf) {
+      if (buf.byteLength < FRAME_HEADER_LEN) { log('二进制帧过短，丢弃'); return; }
+      const dv = new DataView(buf);
+      if (dv.getUint32(0, true) !== FRAME_MAGIC) { log('二进制帧 magic 不匹配，丢弃'); return; }
+      const version = dv.getUint8(4);
+      if (version !== 1) { log(`不支持的帧版本 ${version}`); return; }
+      const stream = dv.getUint8(5);
+      const codec = dv.getUint8(6);
+      const seq = dv.getUint32(8, true);
+      const w = dv.getUint16(12, true);
+      const h = dv.getUint16(14, true);
+      const len = dv.getUint32(20, true);
+      if (buf.byteLength < FRAME_HEADER_LEN + len) { log('二进制帧载荷截断，丢弃'); return; }
+      if (stream !== 0) return; // 仅屏幕流
+      if (w > 0 && h > 0) { frameW = w; frameH = h; }
+      countFrame(len, codec);
+      if (codec === 1) {
+        // JPEG：Blob → Image → 画布（与 JSON 兜底路径同渲染，省去 base64 开销）
+        const blob = new Blob([new Uint8Array(buf, FRAME_HEADER_LEN, len)], { type: 'image/jpeg' });
+        const url = URL.createObjectURL(blob);
+        const img = new Image();
+        img.onload = () => { ctx.drawImage(img, 0, 0, canvas.width, canvas.height); URL.revokeObjectURL(url); };
+        img.onerror = () => { URL.revokeObjectURL(url); };
+        img.src = url;
+      } else if (codec === 0 && w > 0 && h > 0) {
+        // RAW_RGBA：直接 putImageData
+        if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+        ctx.putImageData(new ImageData(new Uint8ClampedArray(buf, FRAME_HEADER_LEN, len), w, h), 0, 0);
+      } else {
+        // 原生编码（h264/h265/vp8/vp9/av1）：浏览器参考台不解码，展示帧信息（主端 Tauri 渲染）
+        statusEl.textContent = `${CODEC_NAMES[codec] || codec} 帧 #${seq}（浏览器参考台不解码，主端渲染）`;
+      }
     }
 
     async function refreshDevices() {
@@ -84,7 +169,10 @@
       if (ws) ws.close();
       const proto = location.protocol === 'https:' ? 'wss' : 'ws';
       ws = new WebSocket(`${proto}://${location.host}/ws/viewer`);
+      ws.binaryType = 'arraybuffer'; // 二进制媒体帧按 ArrayBuffer 收取（§8.3）
       ws.onmessage = (ev) => {
+        // 二进制媒体帧（协商后的 P2P/中继通道）
+        if (ev.data instanceof ArrayBuffer) { renderBinaryFrame(ev.data); return; }
         const env = JSON.parse(ev.data);
         if (env.type === 'rc_frame') {
           const p = env.payload;
@@ -92,16 +180,24 @@
           const img = new Image();
           img.onload = () => ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
           img.src = 'data:image/jpeg;base64,' + p.data;
+        } else if (env.type === 'rc_capabilities') {
+          const p = env.payload || {};
+          log(`被控端能力：${(p.codecs || []).map(c => CODEC_NAMES[c] || c).join('/')} ${p.max_w || '?'}×${p.max_h || '?'}@${p.fps || '?'}fps`);
+          populateCodecs(p.codecs || []);
+          sendSelect(); // 收到能力即按偏好协商二进制帧通道
+          document.getElementById('renegoBtn').disabled = false;
         } else if (env.type === 'rc_event') {
           const p = env.payload;
           log(`事件[${p.kind}]: ${p.message}` + (p.require_consent ? '（需员工确认）' : ''));
           if (p.kind === 'consent_required') statusEl.textContent = '等待员工确认…';
           if (p.kind === 'consent_granted') statusEl.textContent = '已获授权，画面传输中';
+          if (p.kind === 'media_selected') statusEl.textContent = p.message;
           if (p.kind === 'error') statusEl.textContent = p.message;
         } else if (env.type === 'rc_ready') {
           log(`被控端就绪 ok=${env.payload.ok}`);
         } else if (env.type === 'rc_stop') {
           log('会话已结束');
+          document.getElementById('renegoBtn').disabled = true;
         }
       };
       ws.onclose = () => log('viewer 连接关闭');
@@ -124,7 +220,10 @@
       }
       if (ws) ws.close();
       sessionID = null;
+      document.getElementById('renegoBtn').disabled = true;
     };
+
+    document.getElementById('renegoBtn').onclick = () => sendSelect();
 
     function sendInput(kind, extra) {
       if (!ws || !sessionID) return;

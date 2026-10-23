@@ -1,6 +1,7 @@
 package hub
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/http/httptest"
 	"strings"
@@ -157,3 +158,107 @@ func TestRCP2PRelay(t *testing.T) {
 
 // proto_codecJPEG 返回 JPEG 编解码器 ID（与 Rust rc_media.CODEC_JPEG 对齐）。
 func proto_codecJPEG() int { return 1 }
+
+// readTypedWithTimeout 在 d 内读取一条消息并返回（载荷, 是否二进制）；超时返回错误。
+func readTypedWithTimeout(c *ws.Conn, d time.Duration) ([]byte, bool, error) {
+	type res struct {
+		data    []byte
+		isBinary bool
+		err     error
+	}
+	ch := make(chan res, 1)
+	go func() {
+		data, isBinary, err := c.ReadMessageTyped()
+		ch <- res{data, isBinary, err}
+	}()
+	select {
+	case r := <-ch:
+		return r.data, r.isBinary, r.err
+	case <-time.After(d):
+		return nil, false, errTimeout
+	}
+}
+
+// TestRCBinaryFrameRelay 验证二进制媒体帧经中枢双向透传（§8.3）：
+// Agent→Viewer 二进制帧逐字节一致且 isBinary=true；Viewer→Agent 同。
+func TestRCBinaryFrameRelay(t *testing.T) {
+	h := NewHub(HubConfig{})
+	srv := httptest.NewServer(h.Handler())
+	defer srv.Close()
+
+	// 1) Agent 注册
+	aConn, err := ws.Dial(wsURL(srv, "/ws/agent"))
+	if err != nil {
+		t.Fatalf("agent dial 失败: %v", err)
+	}
+	defer aConn.Close()
+	reg, _ := proto.NewEnvelope(proto.TypeRegister, 0, proto.RegisterPayload{Hostname: "t-agent", OS: "macos", Arch: "arm64"})
+	regB, _ := json.Marshal(reg)
+	if err := aConn.WriteMessage(regB); err != nil {
+		t.Fatalf("写 register 失败: %v", err)
+	}
+	ackRaw, err := aConn.ReadMessage()
+	if err != nil {
+		t.Fatalf("读 register_ack 失败: %v", err)
+	}
+	var ack proto.Envelope
+	if err := json.Unmarshal(ackRaw, &ack); err != nil {
+		t.Fatalf("解析 ack 失败: %v", err)
+	}
+	var ackP proto.RegisterAckPayload
+	if err := ack.DecodePayload(&ackP); err != nil {
+		t.Fatalf("解析 ack payload 失败: %v", err)
+	}
+	deviceID := ackP.DeviceID
+
+	// 2) Viewer 建会话（rc_request 会被中枢转发给 Agent，先消费）
+	vConn, err := ws.Dial(wsURL(srv, "/ws/viewer"))
+	if err != nil {
+		t.Fatalf("viewer dial 失败: %v", err)
+	}
+	defer vConn.Close()
+	req, _ := proto.NewEnvelope(proto.TypeRCRequest, 0, proto.RCRequestPayload{
+		DeviceID: deviceID, SessionID: "s-bin", Operator: "admin",
+	})
+	reqB, _ := json.Marshal(req)
+	if err := vConn.WriteMessage(reqB); err != nil {
+		t.Fatalf("写 rc_request 失败: %v", err)
+	}
+	if _, err := aConn.ReadMessage(); err != nil {
+		t.Fatalf("Agent 未收到转发的 rc_request: %v", err)
+	}
+
+	// 3) Agent → Viewer：二进制媒体帧（构造 §8.3 帧：magic 'YDYF' + 20B 头余部 + JPEG SOI 负载）
+	frame := make([]byte, 0, 64)
+	frame = append(frame, 0x46, 0x59, 0x44, 0x59, 0x01, 0x00, 0x01, 0x00) // magic/ver/stream/codec/flags
+	frame = append(frame, 0x07, 0x00, 0x00, 0x00)                         // seq=7
+	frame = append(frame, 0x40, 0x01, 0x20, 0x01)                         // w=320 h=288
+	frame = append(frame, 0xE8, 0x03, 0x00, 0x00)                         // pts_ms=1000
+	frame = append(frame, 0x04, 0x00, 0x00, 0x00)                         // len=4
+	frame = append(frame, 0xFF, 0xD8, 0xFF, 0xD9)                         // JPEG SOI+EOI
+	if err := aConn.WriteBinary(frame); err != nil {
+		t.Fatalf("Agent WriteBinary 失败: %v", err)
+	}
+	got, isBinary, err := readTypedWithTimeout(vConn, 2*time.Second)
+	if err != nil {
+		t.Fatalf("Viewer 未收到二进制帧: %v", err)
+	}
+	if !isBinary {
+		t.Fatalf("中继后应为二进制帧，实际 isBinary=false")
+	}
+	if !bytes.Equal(got, frame) {
+		t.Fatalf("二进制帧中继后不一致: got=%d want=%d 字节", len(got), len(frame))
+	}
+
+	// 4) Viewer → Agent：二进制帧反向透传
+	if err := vConn.WriteBinary(frame); err != nil {
+		t.Fatalf("Viewer WriteBinary 失败: %v", err)
+	}
+	got2, isBinary2, err := readTypedWithTimeout(aConn, 2*time.Second)
+	if err != nil {
+		t.Fatalf("Agent 未收到 Viewer 二进制帧: %v", err)
+	}
+	if !isBinary2 || !bytes.Equal(got2, frame) {
+		t.Fatalf("Viewer→Agent 二进制中继失败: isBinary=%v equal=%v", isBinary2, bytes.Equal(got2, frame))
+	}
+}

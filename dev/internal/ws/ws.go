@@ -132,16 +132,17 @@ func Dial(urlStr string) (*Conn, error) {
 	return &Conn{conn: raw, buf: br, isClient: true}, nil
 }
 
-// ReadMessage 读取一帧文本消息；自动处理 ping/pong/close。
-func (c *Conn) ReadMessage() ([]byte, error) {
+// ReadMessageTyped 读取一帧消息，返回（载荷, 是否二进制, 错误）；自动处理 ping/pong/close。
+// 二进制帧（opcode 0x2）承载 M4 远控二进制媒体帧（protocol.md §8.3：24B 头 + payload）。
+func (c *Conn) ReadMessageTyped() ([]byte, bool, error) {
 	for {
 		b0, err := c.buf.ReadByte()
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		b1, err := c.buf.ReadByte()
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		opcode := b0 & 0x0f
 		masked := b1&0x80 != 0
@@ -170,22 +171,47 @@ func (c *Conn) ReadMessage() ([]byte, error) {
 		switch opcode {
 		case 0x8: // close
 			c.conn.Close()
-			return nil, io.EOF
+			return nil, false, io.EOF
 		case 0x9: // ping -> pong
 			_ = c.WritePong(payload)
 			continue
 		case 0xA: // pong
 			continue
+		case 0x2: // binary
+			return payload, true, nil
 		case 0x1, 0x0: // text / continuation
-			return payload, nil
+			return payload, false, nil
 		default:
 			continue
 		}
 	}
 }
 
+// ReadMessage 读取一帧文本消息（跳过二进制帧，保持既有调用方语义）；自动处理 ping/pong/close。
+func (c *Conn) ReadMessage() ([]byte, error) {
+	for {
+		data, isBinary, err := c.ReadMessageTyped()
+		if err != nil {
+			return nil, err
+		}
+		if !isBinary {
+			return data, nil
+		}
+	}
+}
+
 // WriteMessage 发送一帧文本消息。
 func (c *Conn) WriteMessage(data []byte) error {
+	return c.writeFrame(0x1, data)
+}
+
+// WriteBinary 发送一帧二进制消息（远控二进制媒体帧中继用，§8.3）。
+func (c *Conn) WriteBinary(data []byte) error {
+	return c.writeFrame(0x2, data)
+}
+
+// writeFrame 发送一个数据帧（opcode: 0x1 文本 / 0x2 二进制）；客户端侧加掩码。
+func (c *Conn) writeFrame(opcode byte, data []byte) error {
 	c.wmu.Lock()
 	defer c.wmu.Unlock()
 	var hdr []byte
@@ -196,15 +222,15 @@ func (c *Conn) WriteMessage(data []byte) error {
 	ln := len(data)
 	switch {
 	case ln < 126:
-		hdr = []byte{0x81, byte(ln) | maskBit}
+		hdr = []byte{0x80 | opcode, byte(ln) | maskBit}
 	case ln <= 0xffff:
 		h := make([]byte, 4)
-		h[0], h[1] = 0x81, 126|maskBit
+		h[0], h[1] = 0x80|opcode, 126|maskBit
 		binary.BigEndian.PutUint16(h[2:4], uint16(ln))
 		hdr = h
 	default:
 		h := make([]byte, 10)
-		h[0], h[1] = 0x81, 127|maskBit
+		h[0], h[1] = 0x80|opcode, 127|maskBit
 		binary.BigEndian.PutUint64(h[2:10], uint64(ln))
 		hdr = h
 	}

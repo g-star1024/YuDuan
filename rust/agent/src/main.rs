@@ -1103,6 +1103,37 @@ fn send_ws_text<W: Write + ?Sized>(w: &mut W, data: &[u8]) -> std::io::Result<()
     Ok(())
 }
 
+// 发送一个掩码二进制帧（opcode 0x2）：远控二进制媒体帧（§8.3）经长连接中继时使用
+// （P2P 直连走 TcpStream，不经此函数；中继兜底/浏览器主端场景经 ws/wss 透传）。
+// 头部长度的 126/127 扩展分支与 send_ws_text 完全一致，仅 opcode 不同。
+fn send_ws_binary<W: Write + ?Sized>(w: &mut W, data: &[u8]) -> std::io::Result<()> {
+    let len = data.len();
+    let mut header = Vec::with_capacity(10);
+    let mask_bit = 0x80u8;
+    if len < 126 {
+        header.push(0x82);
+        header.push((len as u8) | mask_bit);
+    } else if len <= 0xffff {
+        header.push(0x82);
+        header.push(126 | mask_bit);
+        header.extend_from_slice(&(len as u16).to_be_bytes());
+    } else {
+        header.push(0x82);
+        header.push(127 | mask_bit);
+        header.extend_from_slice(&(len as u64).to_be_bytes());
+    }
+    let mask = Lcg::new().bytes(4);
+    header.extend_from_slice(&mask);
+    w.write_all(&header)?;
+    let mut masked = Vec::with_capacity(len);
+    for (i, &b) in data.iter().enumerate() {
+        masked.push(b ^ mask[i % 4]);
+    }
+    w.write_all(&masked)?;
+    w.flush()?;
+    Ok(())
+}
+
 fn run_shell(command: &str) -> (String, i64, String) {
     let (shell, flag) = if cfg!(windows) {
         ("cmd", "/c")
@@ -1335,6 +1366,13 @@ fn session(url: &str) -> std::io::Result<()> {
                     "rc_stop" => {
                         eprintln!("[agent] rc 会话结束指令");
                         rc::stop_rc();
+                    }
+                    // M4 远控（§8.3）：主端协商结果——建立 P2P 直连媒体通道（失败回退中枢二进制中继）
+                    "rc_select" => {
+                        if let Some(p) = env.get("payload") {
+                            let sid = p.get("session_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                            rc::handle_rc_select(&ws.writer.clone(), &rng, &seq, &sid, p);
+                        }
                     }
                     _ => {
                         // 其它类型优雅忽略，不崩溃

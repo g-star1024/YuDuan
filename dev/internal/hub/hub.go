@@ -365,9 +365,14 @@ func (h *Hub) handleAgentWS(w http.ResponseWriter, r *http.Request) {
 
 	var deviceID string
 	for {
-		raw, err := conn.ReadMessage()
+		raw, isBinary, err := conn.ReadMessageTyped()
 		if err != nil {
 			break
+		}
+		// 二进制帧：远控媒体帧透传（§8.3 P2P 兜底/中继模式），无需解析信封。
+		if isBinary {
+			h.relayToViewer(deviceID, raw, true)
+			continue
 		}
 		var env proto.Envelope
 		if err := json.Unmarshal(raw, &env); err != nil {
@@ -394,7 +399,7 @@ func (h *Hub) handleAgentWS(w http.ResponseWriter, r *http.Request) {
 			})
 			ackBytes, _ := json.Marshal(ack)
 			_ = conn.WriteMessage(ackBytes)
-			log.Printf("[hub] agent registered: %s (%s/%s) mem=%dGB disk=%dGB", saved.Hostname, saved.OS, saved.Arch, saved.MemoryGB, saved.DiskGB)
+			log.Printf("[hub] agent registered: id=%s %s (%s/%s) mem=%dGB disk=%dGB", saved.ID, saved.Hostname, saved.OS, saved.Arch, saved.MemoryGB, saved.DiskGB)
 
 		case proto.TypeHeartbeat:
 			if deviceID != "" {
@@ -418,7 +423,7 @@ func (h *Hub) handleAgentWS(w http.ResponseWriter, r *http.Request) {
 			log.Printf("[hub] result task=%s state=%s exit=%d", p.TaskID, p.State, p.ExitCode)
 
 		case proto.TypeRCReady, proto.TypeRCFrame, proto.TypeRCEvent, proto.TypeRCCapabilities, proto.TypeRCAnswer, proto.TypeRCCandidate:
-			h.relayToViewer(deviceID, raw)
+			h.relayToViewer(deviceID, raw, false)
 		case proto.TypeRCStop:
 			h.endSession(deviceID)
 
@@ -436,11 +441,16 @@ func (h *Hub) handleAgentWS(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (h *Hub) relayToViewer(deviceID string, raw []byte) {
+// relayToViewer 将 Agent 消息透传给会话 Viewer；binary=true 时按二进制帧写（媒体帧中继）。
+func (h *Hub) relayToViewer(deviceID string, raw []byte, binary bool) {
 	h.mu.Lock()
 	s, ok := h.sessions[deviceID]
 	h.mu.Unlock()
 	if !ok || s.Viewer == nil {
+		return
+	}
+	if binary {
+		_ = s.Viewer.WriteBinary(raw)
 		return
 	}
 	_ = s.Viewer.WriteMessage(raw)
@@ -467,9 +477,19 @@ func (h *Hub) handleViewerWS(w http.ResponseWriter, r *http.Request) {
 
 	var deviceID string
 	for {
-		raw, err := conn.ReadMessage()
+		raw, isBinary, err := conn.ReadMessageTyped()
 		if err != nil {
 			break
+		}
+		// 二进制帧：Viewer→Agent 媒体方向（如输入回显/音频上行，§8.3 对称中继）。
+		if isBinary {
+			h.mu.Lock()
+			agentConn, ok := h.conns[deviceID]
+			h.mu.Unlock()
+			if ok {
+				_ = agentConn.WriteBinary(raw)
+			}
+			continue
 		}
 		var env proto.Envelope
 		if err := json.Unmarshal(raw, &env); err != nil {

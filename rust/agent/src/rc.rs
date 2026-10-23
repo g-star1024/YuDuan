@@ -6,12 +6,13 @@
 
 use crate::base64_encode;
 use crate::json_string;
-use crate::rc_media::default_capabilities;
+use crate::rc_media::{default_capabilities, encode_frame, make_encoder, Encoder, FrameHeader};
+use crate::send_ws_binary;
 use crate::sha256::base64_decode;
 use crate::send_ws_text;
 use std::io::Write;
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -242,10 +243,168 @@ fn vk_of(name: &str) -> Option<u16> {
 // ===================== 远控会话 =====================
 
 static RC_STOP: AtomicBool = AtomicBool::new(false);
+/// 会话代次：每次 start_rc/stop_rc 递增；帧循环仅当代次仍为 captured 值时继续，
+/// 防止上一次会话的帧线程在新会话开始后残留（连续会话场景）。
+static RC_GEN: AtomicU64 = AtomicU64::new(0);
+
+// ===================== P2P / 二进制帧媒体环（§8.3 运行时接入） =====================
+
+/// 媒体通道：rc_select 协商的产物。
+/// - P2p：与主端的直连 TCP（dial_direct 成功；主端 Tauri/原生客户端监听媒体端口）。
+/// - Relay：经中枢长连接的二进制 WS 帧中继（P2P 不可达时的兜底；浏览器主端固定走此路径，
+///   浏览器无法监听裸 TCP，故 rc.html 只发 transport=relay 的 rc_select）。
+enum MediaChannel {
+    P2p {
+        stream: std::net::TcpStream,
+        codec: u8,
+        encoder: Box<dyn Encoder>,
+    },
+    Relay {
+        codec: u8,
+        encoder: Box<dyn Encoder>,
+    },
+}
+
+/// 当前会话的媒体通道；None = 未协商二进制通道，帧循环走 JSON rc_frame 兜底（M4 MVP 兼容）。
+static RC_MEDIA: std::sync::Mutex<Option<MediaChannel>> = std::sync::Mutex::new(None);
+
+/// 运行时可协商编解码器：当前采集链（screencapture/scrot/import）只产出 JPEG；
+/// 原生编码器（H.264/H.265/…）需要 RGBA 采集源（§8.3 规划项：CoreGraphics/XShm/GDI）。
+/// 对无法产出的选择诚实回退 JPEG 并告知主端——不造假帧。
+fn clamp_runtime_codec(want: u8) -> u8 {
+    if want == crate::rc_media::CODEC_JPEG {
+        return crate::rc_media::CODEC_JPEG;
+    }
+    eprintln!(
+        "[agent] 编解码器 {} 需 RGBA 采集源/原生编码链（规划中），本次回退 jpeg",
+        crate::rc_media::codec_name(want)
+    );
+    crate::rc_media::CODEC_JPEG
+}
+
+/// 处理 rc_select（主端协商结果，§8.3）：
+/// 1) 按主端选择协商编解码器（clamp 到运行时可产出集）；2) transport=p2p 时 dial_direct
+/// 主端媒体地址，失败回退 Relay；3) 落通道并以 rc_event(media_selected) 告知主端实际通道。
+pub fn handle_rc_select(
+    writer: &Writer,
+    rng: &Arc<Mutex<crate::Lcg>>,
+    seq: &Arc<Mutex<u64>>,
+    session_id: &str,
+    p: &crate::Json,
+) {
+    let want_codec = p
+        .get("codec")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(crate::rc_media::CODEC_JPEG as i64) as u8;
+    let transport = p.get("transport").and_then(|v| v.as_str()).unwrap_or("relay");
+    let media_addr = p.get("media_addr").and_then(|v| v.as_str()).unwrap_or("");
+    let codec = clamp_runtime_codec(want_codec);
+
+    let mut channel: Option<MediaChannel> = None;
+    if transport == "p2p" && !media_addr.is_empty() {
+        match crate::rc_media::dial_direct(media_addr) {
+            Ok(stream) => {
+                eprintln!(
+                    "[agent] P2P 媒体直连成功 {} codec={}",
+                    media_addr,
+                    crate::rc_media::codec_name(codec)
+                );
+                channel = Some(MediaChannel::P2p { stream, codec, encoder: make_encoder(codec) });
+            }
+            Err(e) => {
+                eprintln!("[agent] P2P 直连失败({})，回退中枢二进制中继", e);
+            }
+        }
+    }
+    let via_p2p = channel.is_some();
+    if channel.is_none() {
+        channel = Some(MediaChannel::Relay { codec, encoder: make_encoder(codec) });
+    }
+    *RC_MEDIA.lock().unwrap() = channel;
+
+    let via = if via_p2p { "p2p 直连" } else { "中枢二进制中继" };
+    send_rc_event(
+        writer,
+        rng,
+        seq,
+        session_id,
+        "media_selected",
+        &format!("媒体通道就绪：{} + {}", via, crate::rc_media::codec_name(codec)),
+        false,
+        false,
+    );
+}
+
+/// 二进制媒体帧发送结果。
+enum SendOutcome {
+    /// 已按协商通道作为二进制帧发送。
+    Sent,
+    /// 无媒体通道（未协商/已回退），调用方走 JSON 兜底。
+    NoChannel,
+    /// 通道损坏（编码失败/发送失败），调用方应清通道并回退 JSON。
+    Broken,
+}
+
+/// 屏幕帧头：stream=屏幕、关键帧、seq/宽高/pts（小端 24B 头由 encode_frame 序列化）。
+fn screen_header(codec: u8, w: usize, h: usize, seq: i64, pts_ms: u32) -> FrameHeader {
+    FrameHeader {
+        stream: crate::rc_media::STREAM_SCREEN,
+        codec,
+        flags: crate::rc_media::FLAG_KEYFRAME,
+        seq: seq as u32,
+        width: w as u16,
+        height: h as u16,
+        pts_ms,
+    }
+}
+
+/// 将一帧采集画面按协商 codec 编码为二进制帧并按通道发送（P2P 直连 / 中枢二进制中继）。
+fn send_media_frame(writer: &Writer, data: &[u8], w: usize, h: usize, seq: i64, pts_ms: u32) -> SendOutcome {
+    let mut guard = RC_MEDIA.lock().unwrap();
+    match guard.as_mut() {
+        None => SendOutcome::NoChannel,
+        Some(MediaChannel::P2p { stream, codec, encoder }) => {
+            let payload = match encoder.encode(data, w as u32, h as u32) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("[agent] 媒体帧编码失败({})，回退 JSON 中继", e);
+                    return SendOutcome::Broken;
+                }
+            };
+            let frame = encode_frame(&screen_header(*codec, w, h, seq, pts_ms), &payload);
+            match crate::rc_media::send_frame(stream, &frame) {
+                Ok(()) => SendOutcome::Sent,
+                Err(e) => {
+                    eprintln!("[agent] P2P 帧发送失败({})，回退 JSON 中继", e);
+                    SendOutcome::Broken
+                }
+            }
+        }
+        Some(MediaChannel::Relay { codec, encoder }) => {
+            let payload = match encoder.encode(data, w as u32, h as u32) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("[agent] 媒体帧编码失败({})，回退 JSON 中继", e);
+                    return SendOutcome::Broken;
+                }
+            };
+            let frame = encode_frame(&screen_header(*codec, w, h, seq, pts_ms), &payload);
+            match send_ws_binary(&mut *writer.lock().unwrap(), &frame) {
+                Ok(()) => SendOutcome::Sent,
+                Err(e) => {
+                    eprintln!("[agent] 二进制帧中继发送失败({})，回退 JSON 中继", e);
+                    SendOutcome::Broken
+                }
+            }
+        }
+    }
+}
 
 /// 开启远控：合规提示 → rc_ready → 500ms 帧循环，直至 stop。
 pub fn start_rc(writer: Writer, rng: Arc<Mutex<crate::Lcg>>, seq: Arc<Mutex<u64>>, session_id: String, _device_id: String) {
     RC_STOP.store(false, Ordering::SeqCst);
+    let gen = RC_GEN.fetch_add(1, Ordering::SeqCst) + 1; // 新会话代次（旧帧线程随之失效）
+    *RC_MEDIA.lock().unwrap() = None; // 新会话重新协商媒体通道
 
     // 合规：本地通知 + 事件（员工知情可拒绝；开发态自动授权见 rc_event）
     show_remote_notice();
@@ -254,23 +413,35 @@ pub fn start_rc(writer: Writer, rng: Arc<Mutex<crate::Lcg>>, seq: Arc<Mutex<u64>
     send_rc_ready(&writer, &rng, &seq, &session_id, true, "");
 
     // 生产化（§8.3）：宣告远控媒体能力（编解码器 / 分辨率 / 帧率），供主端协商 P2P 二进制帧通道。
-    let caps = default_capabilities().to_json();
+    // 载荷扁平（与 protocol.md §8.3 / Go proto.RCCapabilitiesPayload 一致）。
+    let caps = default_capabilities().to_payload_fields();
     send_rc_capabilities(&writer, &rng, &seq, &session_id, &caps);
 
     thread::spawn(move || {
+        let started = std::time::Instant::now();
         let mut frame_seq: i64 = 0;
-        while !RC_STOP.load(Ordering::SeqCst) {
+        // 代次守卫：新会话开始或 stop 后，旧帧循环立即退出（不残留）。
+        while RC_GEN.load(Ordering::SeqCst) == gen && !RC_STOP.load(Ordering::SeqCst) {
             thread::sleep(Duration::from_millis(500));
-            if RC_STOP.load(Ordering::SeqCst) {
+            if RC_GEN.load(Ordering::SeqCst) != gen || RC_STOP.load(Ordering::SeqCst) {
                 break;
             }
             frame_seq += 1;
             match capture_jpeg() {
                 Some((data, w, h)) => {
-                    let payload = format!(
-                        "{{\"session_id\":{},\"seq\":{},\"width\":{},\"height\":{},\"format\":\"jpeg\",\"data\":{},\"ts\":{}}}",
-                        json_string(&session_id), frame_seq, w, h, json_string(&base64_encode(&data)), crate::now_secs()
-                    );
+                    // 二进制媒体环（§8.3）：已协商通道 → 按协商 codec 编码采集帧 → 二进制帧。
+                    match send_media_frame(&writer, &data, w, h, frame_seq, started.elapsed().as_millis() as u32) {
+                        SendOutcome::Sent => continue,
+                        SendOutcome::Broken => {
+                            // 通道损坏：清空回退 JSON 中继（会话不中断）
+                            *RC_MEDIA.lock().unwrap() = None;
+                            send_rc_event(&writer, &rng, &seq, &session_id, "notice",
+                                "媒体通道中断，已回退 JSON 中继", false, false);
+                        }
+                        SendOutcome::NoChannel => {}
+                    }
+                    // JSON rc_frame 兜底（未协商二进制通道时，M4 MVP 兼容）
+                    let payload = rc_frame_payload(&session_id, frame_seq, w, h, &data);
                     let msg = {
                         let mut rng_g = rng.lock().unwrap();
                         let mut seq_g = seq.lock().unwrap();
@@ -295,6 +466,9 @@ pub fn start_rc(writer: Writer, rng: Arc<Mutex<crate::Lcg>>, seq: Arc<Mutex<u64>
 
 pub fn stop_rc() {
     RC_STOP.store(true, Ordering::SeqCst);
+    RC_GEN.fetch_add(1, Ordering::SeqCst); // 使旧帧循环代次失效
+    // 关闭 P2P 直连（drop TcpStream）并清通道，下次 start_rc 重新协商。
+    *RC_MEDIA.lock().unwrap() = None;
 }
 
 /// 处理 rc_input：注入键鼠（macOS 真实注入；其余平台记录）。
@@ -684,6 +858,14 @@ fn jpeg_size(data: &[u8]) -> Option<(usize, usize)> {
 
 // ===================== 协议消息 =====================
 
+/// JSON rc_frame 载荷（M4 MVP 中继兜底；二进制通道就绪后走 §8.3 二进制帧）。
+fn rc_frame_payload(session_id: &str, seq: i64, w: usize, h: usize, data: &[u8]) -> String {
+    format!(
+        "{{\"session_id\":{},\"seq\":{},\"width\":{},\"height\":{},\"format\":\"jpeg\",\"data\":{},\"ts\":{}}}",
+        json_string(session_id), seq, w, h, json_string(&base64_encode(data)), crate::now_secs()
+    )
+}
+
 fn send_rc_ready(writer: &Writer, rng: &Arc<Mutex<crate::Lcg>>, seq: &Arc<Mutex<u64>>, session_id: &str, ok: bool, reason: &str) {
     let payload = format!(
         "{{\"session_id\":{},\"ok\":{},\"reason\":{}}}",
@@ -698,6 +880,8 @@ fn send_rc_ready(writer: &Writer, rng: &Arc<Mutex<crate::Lcg>>, seq: &Arc<Mutex<
 }
 
 /// 宣告远控媒体能力（§8.3）：编解码器 / 最大分辨率 / 帧率；主端据此协商二进制帧通道。
+/// 载荷为扁平字段，与 protocol.md §8.3 及 Go proto.RCCapabilitiesPayload 一致：
+/// {"session_id":…, "codecs":[…], "max_w":…, "max_h":…, "fps":…}
 fn send_rc_capabilities(
     writer: &Writer,
     rng: &Arc<Mutex<crate::Lcg>>,
@@ -705,10 +889,7 @@ fn send_rc_capabilities(
     session_id: &str,
     caps_json: &str,
 ) {
-    let payload = format!(
-        "{{\"session_id\":{},\"capabilities\":{}}}",
-        json_string(session_id), caps_json
-    );
+    let payload = format!("{{\"session_id\":{},{}}}", json_string(session_id), caps_json);
     let msg = {
         let mut rng_g = rng.lock().unwrap();
         let mut seq_g = seq.lock().unwrap();
@@ -807,5 +988,83 @@ mod tests {
         assert_eq!(vk_of("f1"), Some(0x70));
         assert_eq!(vk_of("pageup"), Some(0x21)); // VK_PRIOR
         assert_eq!(vk_of("nope"), None);
+    }
+
+    #[test]
+    fn clamp_runtime_codec_only_jpeg_survives() {
+        // 当前采集链只产 JPEG：其余选择（含原生与 RAW）诚实回退，不假造帧。
+        assert_eq!(clamp_runtime_codec(crate::rc_media::CODEC_JPEG), crate::rc_media::CODEC_JPEG);
+        assert_eq!(clamp_runtime_codec(crate::rc_media::CODEC_H264), crate::rc_media::CODEC_JPEG);
+        assert_eq!(clamp_runtime_codec(crate::rc_media::CODEC_H265), crate::rc_media::CODEC_JPEG);
+        assert_eq!(clamp_runtime_codec(crate::rc_media::CODEC_RAW_RGBA), crate::rc_media::CODEC_JPEG);
+    }
+
+    #[test]
+    fn screen_header_builds_decodable_frame() {
+        let hdr = screen_header(crate::rc_media::CODEC_JPEG, 320, 240, 9, 1500);
+        assert_eq!(hdr.stream, crate::rc_media::STREAM_SCREEN);
+        assert_eq!(hdr.codec, crate::rc_media::CODEC_JPEG);
+        assert_ne!(hdr.flags & crate::rc_media::FLAG_KEYFRAME, 0);
+        assert_eq!((hdr.width, hdr.height), (320, 240));
+        assert_eq!(hdr.seq, 9);
+        let jpeg = [0xFFu8, 0xD8, 0xFF, 0xD9];
+        let frame = encode_frame(&hdr, &jpeg);
+        let (got, pl) = crate::rc_media::decode_frame(&frame).unwrap();
+        assert_eq!(got, hdr);
+        assert_eq!(pl, &jpeg);
+    }
+
+    #[test]
+    fn rc_select_payload_parses_with_defaults() {
+        // 缺省字段 → jpeg / relay / 空地址（与 handle_rc_select 取值表达式一致）
+        let j = crate::parse_json("{\"session_id\":\"s-1\"}".as_bytes()).unwrap();
+        assert_eq!(j.get("codec").and_then(|v| v.as_i64()).unwrap_or(1) as u8, crate::rc_media::CODEC_JPEG);
+        assert_eq!(j.get("transport").and_then(|v| v.as_str()).unwrap_or("relay"), "relay");
+        assert_eq!(j.get("media_addr").and_then(|v| v.as_str()).unwrap_or(""), "");
+        // 完整字段
+        let j2 = crate::parse_json(
+            "{\"codec\":1,\"transport\":\"p2p\",\"media_addr\":\"127.0.0.1:19500\"}".as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(j2.get("codec").and_then(|v| v.as_i64()).unwrap_or(0) as u8, crate::rc_media::CODEC_JPEG);
+        assert_eq!(j2.get("transport").and_then(|v| v.as_str()).unwrap_or("relay"), "p2p");
+        assert_eq!(j2.get("media_addr").and_then(|v| v.as_str()).unwrap_or(""), "127.0.0.1:19500");
+    }
+
+    #[test]
+    fn rc_frame_payload_is_valid_json_with_base64() {
+        let data = [0xFFu8, 0xD8, 0xFF, 0xD9];
+        let payload = rc_frame_payload("s-42", 3, 640, 480, &data);
+        let j = crate::parse_json(payload.as_bytes()).expect("rc_frame 载荷应为合法 JSON");
+        assert_eq!(j.get("session_id").and_then(|v| v.as_str()), Some("s-42"));
+        assert_eq!(j.get("seq").and_then(|v| v.as_i64()), Some(3));
+        assert_eq!(j.get("width").and_then(|v| v.as_i64()), Some(640));
+        assert_eq!(j.get("height").and_then(|v| v.as_i64()), Some(480));
+        assert_eq!(j.get("format").and_then(|v| v.as_str()), Some("jpeg"));
+        let b64 = j.get("data").and_then(|v| v.as_str()).unwrap();
+        assert_eq!(base64_decode(b64).unwrap(), data);
+    }
+
+    #[test]
+    fn rc_capabilities_payload_is_flat_per_protocol() {
+        // 载荷必须扁平（§8.3 / Go proto.RCCapabilitiesPayload）：session_id + codecs/max_w/max_h/fps
+        let caps = crate::rc_media::Capabilities {
+            codecs: vec![crate::rc_media::CODEC_RAW_RGBA, crate::rc_media::CODEC_JPEG],
+            max_w: 1920,
+            max_h: 1080,
+            fps: 15,
+        };
+        let payload = format!("{{\"session_id\":{},{}}}", json_string("s-7"), caps.to_payload_fields());
+        let j = crate::parse_json(payload.as_bytes()).expect("rc_capabilities 载荷应为合法 JSON");
+        assert_eq!(j.get("session_id").and_then(|v| v.as_str()), Some("s-7"));
+        // 扁平字段可直接取到（不得嵌套在 capabilities 下）
+        assert!(j.get("capabilities").is_none(), "载荷不应嵌套 capabilities");
+        assert_eq!(j.get("max_w").and_then(|v| v.as_i64()), Some(1920));
+        assert_eq!(j.get("max_h").and_then(|v| v.as_i64()), Some(1080));
+        assert_eq!(j.get("fps").and_then(|v| v.as_i64()), Some(15));
+        match j.get("codecs") {
+            Some(crate::Json::Arr(a)) => assert_eq!(a.len(), 2),
+            _ => panic!("codecs 应为数组"),
+        }
     }
 }

@@ -149,8 +149,9 @@ pub struct Capabilities {
 }
 
 impl Capabilities {
-    pub fn to_json(&self) -> String {
-        let mut s = String::from("{\"codecs\":[");
+    /// 扁平字段序列（不含外层花括号）：便于嵌入 rc_capabilities 信封载荷（§8.3 扁平载荷）。
+    pub fn to_payload_fields(&self) -> String {
+        let mut s = String::from("\"codecs\":[");
         for (i, code) in self.codecs.iter().enumerate() {
             if i > 0 {
                 s.push(',');
@@ -158,10 +159,15 @@ impl Capabilities {
             s.push_str(&code.to_string());
         }
         s.push_str(&format!(
-            "],\"max_w\":{},\"max_h\":{},\"fps\":{}}}",
+            "],\"max_w\":{},\"max_h\":{},\"fps\":{}",
             self.max_w, self.max_h, self.fps
         ));
         s
+    }
+
+    /// 完整 JSON 对象（含外层花括号）。
+    pub fn to_json(&self) -> String {
+        format!("{{{}}}", self.to_payload_fields())
     }
 }
 

@@ -4,12 +4,12 @@
 
 ## 1. 传输与端点
 
-| 通道 | 协议 | 端点 | 用途 |
-|---|---|---|---|
-| 管理 REST | HTTPS | `https://hub/api/v1/*` | 主端管理操作、查询 |
-| 设备长连接 | WSS | `wss://hub/ws/agent` | Agent 注册/心跳/指令 |
-| 控制台长连接 | WSS | `wss://hub/ws/console` | 主端实时事件/远控信令 |
-| 远控媒体 | UDP/RTP 或 TCP（加密） | 经中枢中继或 LAN 直连 | 画面帧 / 输入事件 |
+| 通道      | 协议                | 端点                     | 用途             |
+| ------- | ----------------- | ---------------------- | -------------- |
+| 管理 REST | HTTPS             | `https://hub/api/v1/*` | 主端管理操作、查询      |
+| 设备长连接   | WSS               | `wss://hub/ws/agent`   | Agent 注册/心跳/指令 |
+| 控制台长连接  | WSS               | `wss://hub/ws/console` | 主端实时事件/远控信令    |
+| 远控媒体    | UDP/RTP 或 TCP（加密） | 经中枢中继或 LAN 直连          | 画面帧 / 输入事件     |
 
 - 所有通道 TLS；设备/主端持设备令牌或账号令牌。
 - 网络范围：仅公司局域网（LAN）。**禁止公网端点**（铁律 1）。
@@ -34,22 +34,23 @@
 
 ## 3. 消息类型
 
-| type | 方向 | 说明 |
-|---|---|---|
-| `register` | Agent→Hub | 首次/重连纳管：指纹、平台、版本 |
-| `heartbeat` | Agent→Hub | 在线、负载、IP、最后采集摘要 |
-| `command` | Hub→Agent | `remote_control` / `sw_install` / `file_push` / `script_run` / `policy_apply` |
-| `ack` | Agent→Hub | 指令接收确认 |
-| `result` | Agent→Hub | 执行结果（exit_code / output_log / state） |
-| `rc_offer` / `rc_answer` / `rc_candidate` | 主端↔Hub↔Agent | 远控信令（SDP / ICE-lite 候选） |
-| `rc_frame` / `rc_input` | 双向（媒体通道） | 画面帧 / 输入事件 |
-| `event` | Hub→Console | 实时事件（在线/离线/告警/任务进度） |
+| type                                      | 方向           | 说明                                                                            |
+| ----------------------------------------- | ------------ | ----------------------------------------------------------------------------- |
+| `register`                                | Agent→Hub    | 首次/重连纳管：指纹、平台、版本                                                              |
+| `heartbeat`                               | Agent→Hub    | 在线、负载、IP、最后采集摘要                                                               |
+| `command`                                 | Hub→Agent    | `remote_control` / `sw_install` / `file_push` / `script_run` / `policy_apply` |
+| `ack`                                     | Agent→Hub    | 指令接收确认                                                                        |
+| `result`                                  | Agent→Hub    | 执行结果（exit_code / output_log / state）                                          |
+| `rc_offer` / `rc_answer` / `rc_candidate` | 主端↔Hub↔Agent | 远控信令（SDP / ICE-lite 候选）                                                       |
+| `rc_frame` / `rc_input`                   | 双向（媒体通道）     | 画面帧 / 输入事件                                                                    |
+| `event`                                   | Hub→Console  | 实时事件（在线/离线/告警/任务进度）                                                           |
 
 ## 4. 远控媒体帧（二进制）
 
 ```
 [ session_id:16 ][ frame_seq:u32 ][ flags:u8 ][ data... ]
 ```
+
 - `flags`：bit0=关键帧(I)、bit1=黑屏、bit2=水印。
 - 编码：H.264/H.265 或 VP8/9（专利评估见 TDD 15）；LAN 默认高画质，弱网降码率。
 - 输入事件：本地键鼠序列化后回传远端注入；Windows `Ctrl+Alt+Del`（SAS）走专用服务。
@@ -64,16 +65,16 @@
 
 ## 6. 错误码
 
-| code | 含义 |
-|---|---|
-| 0 | 成功 |
-| 1001 | 未授权/令牌失效 |
-| 1002 | 签名校验失败 |
-| 1003 | seq 重放/乱序 |
-| 2001 | 设备离线 |
+| code | 含义                |
+| ---- | ----------------- |
+| 0    | 成功                |
+| 1001 | 未授权/令牌失效          |
+| 1002 | 签名校验失败            |
+| 1003 | seq 重放/乱序         |
+| 2001 | 设备离线              |
 | 2002 | 安装失败（见 exit_code） |
-| 3001 | 远控被拒（权限/审批） |
-| 3002 | 媒体协商失败 |
+| 3001 | 远控被拒（权限/审批）       |
+| 3002 | 媒体协商失败            |
 
 ## 7. 心跳策略
 
@@ -82,20 +83,20 @@
 
 ## 8. M4/M5 实现说明（MVP 切片，对 M1 基线的演进）
 
-> M1 基线（§1/§3/§4/§5）规划了 WebRTC 风格 `rc_offer/answer/candidate` 与二进制媒体帧、P2P/LAN 直连。
-> **为快速打通 MVP 链路**，M4 采用「中枢居中中继」的最小实现，仍在 §1 的局域网与 TLS 范围内；
+> M1 基线（§1/§3/§4/§5）规划了 WebRTC 风格 `rc_offer/answer/candidate` 与二进制媒体帧、P2P/LAN 直连。  
+> **为快速打通 MVP 链路**，M4 采用「中枢居中中继」的最小实现，仍在 §1 的局域网与 TLS 范围内；  
 > 生产目标（P2P 直连、H.264/H.265 编码、二进制帧、SAS 专用通道、加密录像）在后续里程碑演进。
 
 ### 8.1 已落地消息类型（JSON over WebSocket，复用控制长连接）
 
-| type | 方向 | 说明 |
-|---|---|---|
-| `rc_request` | Viewer→Hub→Agent | 发起远控：{device_id, session_id, operator}；中枢校验设备在线后转发被控端 |
-| `rc_ready` | Agent→Hub→Viewer | 被控端采集就绪 {session_id, ok, reason} |
-| `rc_frame` | Agent→Hub→Viewer | 一帧画面 {session_id, seq, width, height, format:"jpeg", data:base64} |
-| `rc_input` | Viewer→Hub→Agent | 键鼠输入 {session_id, kind, x, y, button, key} |
-| `rc_stop` | 任一端→对端 | 结束会话 |
-| `rc_event` | Agent→Hub→Viewer | 合规/确认事件 {session_id, kind, message, require_consent, consented} |
+| type         | 方向               | 说明                                                                |
+| ------------ | ---------------- | ----------------------------------------------------------------- |
+| `rc_request` | Viewer→Hub→Agent | 发起远控：{device_id, session_id, operator}；中枢校验设备在线后转发被控端             |
+| `rc_ready`   | Agent→Hub→Viewer | 被控端采集就绪 {session_id, ok, reason}                                  |
+| `rc_frame`   | Agent→Hub→Viewer | 一帧画面 {session_id, seq, width, height, format:"jpeg", data:base64} |
+| `rc_input`   | Viewer→Hub→Agent | 键鼠输入 {session_id, kind, x, y, button, key}                        |
+| `rc_stop`    | 任一端→对端           | 结束会话                                                              |
+| `rc_event`   | Agent→Hub→Viewer | 合规/确认事件 {session_id, kind, message, require_consent, consented}   |
 
 - 会话中继：中枢维护 `deviceID→{viewerConn,session}`；被控端画面/事件按 deviceID 转发给对应 viewer，输入反向转发。
 - 合规提示：Agent 收到 `rc_request` 即在被控端弹本地通知（`远端提示`，员工可拒绝）+ 回报 `rc_event(consent_required)`；生产需员工确认后才开流（MVP 开发态自动授权）。
@@ -104,7 +105,7 @@
 
 - 仓库：`POST /api/v1/software`（multipart 上传）→ 落盘 `data/repo/<id>` + 内存目录；**上传即计算 SHA-256 并在配置 `YUDUAN_SIGN_SEED` 时用 Ed25519 对「32 字节摘要」签名**，校验参数随目录项持久（`sha256`/`signature`/`signer`）。
 - 下载：`GET /api/v1/repo/<id>`（Agent 经 HTTP 拉取，LAN 内）。
-- 下发：`POST /api/v1/devices/:id/commands {action:"sw_install", software_url, platform, pkg_name, sha256, signature, signer}`。
+- 下发：`POST /api/v1/devices/:id/commands {action:"sw_install", software_url, platform, pkg_name, sha256, signature, signer}`。  
   中枢在 `software_url` 指向本仓库（`/api/v1/repo/<id>`）时，**自动解析仓库项并附加校验参数**；外部 URL 不附加。
 - Agent 侧（Rust 生产副端）：下载 → **先 SHA-256 比对、再 Ed25519 验签**（签名为「对 32 字节摘要」的签名，受信公钥优先取 payload `signer`、缺省回退 `YUDUAN_SW_PUBKEY`）→ 校验通过才按扩展名静默安装（`.pkg`→`installer -target /`；`.zip`→解包；`.msi/.exe`→Windows 静默；`.deb/.rpm`→Linux）→ 回报 `result`。
   - 哈希不符 `exit_code=3`、验签失败 `exit_code=4`，均拒绝安装；**只给一半校验参数视为配置错误、同样拒绝**（避免「以为验签了其实没验」）。
@@ -113,9 +114,10 @@
 
 ### 8.3 生产化远控（P2P 直连 + 二进制帧 + 编码器协商 + 原生编码器 ABI）
 
-> M4 MVP（§8.1）采用「中枢居中中继 + JPEG base64 文本帧」。本节能演进为 §4 规划的生产目标：
-> **二进制帧 + 编解码器协商 + P2P 直连媒体通道（中继兜底）+ 原生编码器（H.264/H.265/VP8/VP9/AV1）**。
-> 既有 JSON 中继路径保留为 P2P 不可达时的兜底，二者并存、不互斥。
+> M4 MVP（§8.1）采用「中枢居中中继 + JPEG base64 文本帧」。本节能演进为 §4 规划的生产目标：  
+> **二进制帧 + 编解码器协商 + P2P 直连媒体通道（中继兜底）+ 原生编码器（H.264/H.265/VP8/VP9/AV1）**。  
+> 既有 JSON 中继路径保留为 P2P 不可达时的兜底，二者并存、不互斥。  
+> **2026-10-23：运行时闭环已接入**（见 8.3.5），端到端验证通过（P2P 直连 / 中继 / 回退三场景）。
 
 #### 8.3.1 二进制帧（固定头 + payload）
 
@@ -123,6 +125,7 @@
 [ magic:u32 'YDYF' ][ version:u8=1 ][ stream:u8 ][ codec:u8 ][ flags:u8 ]
 [ seq:u32 ][ width:u16 ][ height:u16 ][ pts_ms:u32 ][ len:u32 ][ payload:bytes[len] ]
 ```
+
 - `stream`：0 屏幕 / 1 输入回显 / 2 音频。
 - `codec`：`0=RAW_RGBA 1=JPEG 2=H264 3=H265 4=VP8 5=VP9 6=AV1`。
 - `flags`：bit0=I 帧 / bit1=黑屏 / bit2=水印。
@@ -148,4 +151,28 @@
 - 环境变量 `YUDUAN_ENCODER_LIB` 指向该库；缺失或加载失败时 `make_encoder()` **自动回退** `RAW_RGBA`/`JPEG`，二进制帧通道不中断。
 - 编码器协商命中原生编解码器即走原生库；否则回退（仅带宽略高，功能不受影响）。
 
+#### 8.3.5 运行时闭环（2026-10-23 接入，端到端已验证）
 
+**端到端口径**（被控端 = Rust 副端；主端 = Tauri/浏览器）：
+
+```
+主端 rc_request ──► 被控端 start_rc：合规提示 + rc_ready + rc_capabilities（扁平载荷）
+主端 ◄── 能力告知后回 rc_select{codec, transport, media_addr?}
+被控端 handle_rc_select：clamp 协商 codec →（p2p）dial_direct(media_addr) /（relay）二进制 WS 通道
+帧循环（500ms）：capture → 按协商 codec 编码 → encode_frame → send_frame(TCP) / 二进制 WS 帧
+主端 ◄── 二进制帧（hub 对 0x2 opcode 双向透传，不解内容）
+任一端 rc_stop ──► 会话结束（清通道、drop 直连）
+```
+
+- **编解码器 clamp（诚实回退，不造假帧）**：当前采集链（macOS `screencapture` / Linux `scrot|import`）只产出 JPEG；主端选择 `RAW_RGBA` 或原生编解码器时，被控端回退 JPEG 并以 `rc_event(kind=media_selected)` 明确告知实际通道。原生编码器的输入是 RGBA，待 RGBA 采集源（§8.3.6）接入后即插即用。
+- **通道选择**：`transport=p2p` 且 `media_addr` 可达 → P2p 直连（`dial_direct` 3s 超时）；不可达或 `relay` → 经中枢长连接的二进制 WS 帧中继（`ws` 包 opcode `0x2`，hub 双向透传）。直连失败自动回退中继，会话不中断。
+- **主端差异**：浏览器（`console/rc.html`）无法监听裸 TCP，固定 `transport=relay`，按 `ArrayBuffer` 收帧并解码渲染（jpeg→canvas、raw_rgba→`putImageData`、原生码流→帧统计展示，由原生主端解码）；P2P 直连服务原生主端（Tauri）。
+- **兜底**：未协商二进制通道（rc_select 未达/前）或通道损坏（编码/发送失败）时，帧循环回退 JSON `rc_frame`（M4 MVP 兼容），损坏时清通道并发 `rc_event(notice)`。
+- **会话代次守卫**：`RC_GEN` 代次计数防止上一次会话的帧循环残留（连续会话场景）。
+- **参考实现与验证**：`dev/cmd/p2pviewer`（e2e viewer：建会话→协商→按 transport 收帧→校验 magic/SOI→落盘）；三场景实测：P2P 直连 5 帧、中继 5 帧、P2P 不可达回退中继 5 帧，落盘均为真实 JPEG（3584×2240）。
+
+#### 8.3.6 剩余缺口（规划项）
+
+- **RGBA 采集源**：macOS CoreGraphics（`CGDisplayCreateImage`→像素）/ Linux XShm·XGetImage / Windows GDI，接入后原生编码器（C-ABI）与 `RAW_RGBA` 通道即可产出真实码流。
+- **ICE-lite 候选交换**：`rc_offer`/`rc_answer`/`rc_candidate` 信令已定义且中枢双向中继，被控端尚未消费；当前 P2P 为 `rc_select.media_addr` 单地址直连，候选交换用于 NAT/多网卡场景择优。
+- **原生码流解码渲染**：浏览器参考台不内置 H.264/H.265 解码；主端（Tauri）需接 WebCodecs 或原生解码器完成渲染。
