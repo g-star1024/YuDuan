@@ -51,6 +51,9 @@ dev/
 ├── e2e_m6.py               # M6/安全端到端验证脚本（35 项：登录/RBAC/强制改密/argon2id/WORM/HMAC/TLS）
 ├── e2e_rust.py             # Rust 生产副端端到端验证（12 项：ws/wss/HMAC/sw_install/远控）
 ├── e2e_pg.py               # PostgreSQL + 多中枢总线端到端验证（17 项：连接池/参数化/去粘性/WORM 触发器/持久化）
+├── e2e_vt_encoder.py       # 真实原生编码器端到端验证（9 项：h264/h265 真码流 + P 帧 + ffmpeg 零错误解码）
+├── encoder-vt/             # macOS VideoToolbox 原生编码器动态库 + 直测 fixture（见 encoder-vt/README.md）
+├── fixtures/               # 编码器验证桩（yuduan_enc_stub.c，§8.3.4 契约形状）
 ├── proto/                  # M1 冻结：通信协议 + 数据库 Schema
 ├── agent/INTERFACES.md     # M1 冻结：副端跨平台接口契约
 ├── hub/README.md           # 中枢说明
@@ -93,7 +96,11 @@ python3 e2e_m6.py
 python3 e2e_rust.py
 # PostgreSQL + 多中枢总线（连接池/参数化/去粘性/WORM 触发器/持久化，17 项；自动 initdb 本地实例）
 python3 e2e_pg.py
+# 真实原生编码器全链路（VideoToolbox h264/h265 真码流 + P 帧 + ffmpeg 解码校验，9 项）
+python3 e2e_vt_encoder.py
 ```
+
+> e2e 脚本默认用 8080（环境占用时设置 `YUDUAN_E2E_PORT=18100` 绕开；`e2e_vt_encoder.py` 固定使用 18100）。
 
 ### Rust 生产副端
 

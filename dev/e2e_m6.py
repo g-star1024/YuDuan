@@ -12,6 +12,9 @@ BIN = "/tmp/yuduan-e2e"
 HUB = os.path.join(BIN, "hub")
 AGENT = os.path.join(BIN, "agent")
 SECRET = "e2e-secret"
+# 端口可配（本机 8080 常被 Docker Desktop 占用，硬编码会让整轮 e2e 假失败）。
+PORT = os.environ.get("YUDUAN_E2E_PORT", "8080")
+BASE = "http://127.0.0.1:" + PORT
 os.makedirs(BIN, exist_ok=True)
 os.makedirs(os.path.join(DEV, "certs"), exist_ok=True)
 
@@ -22,7 +25,8 @@ def build():
     print("[build] hub + agent 编译完成")
 
 def start_hub(env_extra=None):
-    env = dict(os.environ, YUDUAN_HMAC_SECRET=SECRET, YUDUAN_REPO="/tmp/yuduan-e2e-repo")
+    env = dict(os.environ, YUDUAN_HMAC_SECRET=SECRET, YUDUAN_REPO="/tmp/yuduan-e2e-repo",
+               YUDUAN_HUB_ADDR=":" + PORT)
     if env_extra:
         env.update(env_extra)
     p = subprocess.Popen(["go", "run", "."] if False else [HUB],
@@ -30,14 +34,16 @@ def start_hub(env_extra=None):
                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     return p
 
-def start_agent(secret=SECRET, enforce=False, hub="ws://127.0.0.1:8080/ws/agent"):
+def start_agent(secret=SECRET, enforce=False, hub=None):
+    hub = hub or f"ws://127.0.0.1:{PORT}/ws/agent"
     env = dict(os.environ, YUDUAN_HUB=hub, YUDUAN_HMAC_SECRET=secret,
                YUDUAN_HMAC_ENFORCE="1" if enforce else "0")
     p = subprocess.Popen([AGENT], cwd=DEV, env=env,
                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     return p
 
-def http_get(path, token=None, base="http://127.0.0.1:8080", https=False):
+def http_get(path, token=None, base=None, https=False):
+    base = base or BASE
     url = path if path.startswith("http") else base + path
     req = urllib.request.Request(url)
     if token:
@@ -60,7 +66,8 @@ def http_get(path, token=None, base="http://127.0.0.1:8080", https=False):
     except Exception as e:
         return -1, {"error": str(e)}
 
-def http_post(path, data, token=None, base="http://127.0.0.1:8080"):
+def http_post(path, data, token=None, base=None):
+    base = base or BASE
     url = base + path
     req = urllib.request.Request(url, data=json.dumps(data).encode(),
                                  headers={"Content-Type": "application/json"})

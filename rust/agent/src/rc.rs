@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
+use std::time::Instant;
 
 type Writer = Arc<Mutex<Box<dyn Write + Send>>>;
 
@@ -508,6 +509,9 @@ enum SendOutcome {
     Sent,
     /// 无媒体通道（未协商/已回退），调用方走 JSON 兜底。
     NoChannel,
+    /// 采集早于协商完成（首帧竞态）：载荷种类与通道编解码器不匹配，本帧丢弃、
+    /// 下一轮按已协商通道重新采集。不得当作 Broken——否则会误清刚协商好的通道。
+    Recapture,
     /// 通道损坏（编码失败/发送失败），调用方应清通道并回退 JSON。
     Broken,
 }
@@ -526,15 +530,38 @@ fn screen_header(codec: u8, w: usize, h: usize, seq: i64, pts_ms: u32) -> FrameH
 }
 
 /// 将一帧采集画面按协商 codec 编码为二进制帧并按通道发送（P2P 直连 / 中枢二进制中继）。
-fn send_media_frame(writer: &Writer, data: &[u8], w: usize, h: usize, seq: i64, pts_ms: u32) -> SendOutcome {
+fn send_media_frame(
+    writer: &Writer,
+    data: &[u8],
+    w: usize,
+    h: usize,
+    seq: i64,
+    pts_ms: u32,
+    is_raw: bool,
+) -> SendOutcome {
     let mut guard = RC_MEDIA.lock().unwrap();
+    // 载荷种类必须与通道编解码器一致：JPEG 通道收 JPEG，其余（RAW/原生）收 RGBA。
+    // 若不一致说明本帧采集早于 rc_select 协商完成（首帧竞态），丢弃本帧让下一轮重采——
+    // 强行编码会把 JPEG 字节塞进 H.264 编码器（缓冲区怎么扩都不可能对），必须在此拦截。
+    let ch_codec = match guard.as_ref() {
+        None => return SendOutcome::NoChannel,
+        Some(ch) => ch.codec(),
+    };
+    if is_raw != (ch_codec != crate::rc_media::CODEC_JPEG) {
+        return SendOutcome::Recapture;
+    }
     match guard.as_mut() {
         None => SendOutcome::NoChannel,
         Some(MediaChannel::P2p { stream, codec, encoder }) => {
             let payload = match encoder.encode(data, w as u32, h as u32) {
                 Ok(p) => p,
                 Err(e) => {
-                    eprintln!("[agent] 媒体帧编码失败({})，回退 JSON 中继", e);
+                    // 诊断留痕：原生编码失败必须能看到"送进去的是什么"，否则无法判断
+                    // 是编码器库问题还是采集/降采样尺寸不符（曾因此误判为缓冲区不足）。
+                    eprintln!(
+                        "[agent] 媒体帧编码失败({})，回退 JSON 中继 [P2P data={}B {}x{} codec={}]",
+                        e, data.len(), w, h, crate::rc_media::codec_name(*codec)
+                    );
                     return SendOutcome::Broken;
                 }
             };
@@ -551,7 +578,10 @@ fn send_media_frame(writer: &Writer, data: &[u8], w: usize, h: usize, seq: i64, 
             let payload = match encoder.encode(data, w as u32, h as u32) {
                 Ok(p) => p,
                 Err(e) => {
-                    eprintln!("[agent] 媒体帧编码失败({})，回退 JSON 中继", e);
+                    eprintln!(
+                        "[agent] 媒体帧编码失败({})，回退 JSON 中继 [relay data={}B {}x{} codec={}]",
+                        e, data.len(), w, h, crate::rc_media::codec_name(*codec)
+                    );
                     return SendOutcome::Broken;
                 }
             };
@@ -590,9 +620,28 @@ pub fn start_rc(writer: Writer, rng: Arc<Mutex<crate::Lcg>>, seq: Arc<Mutex<u64>
     thread::spawn(move || {
         let started = std::time::Instant::now();
         let mut frame_seq: i64 = 0;
+        // 可变帧率（§8.3.7）：目标帧率取 capabilities.fps（可用 YUDUAN_RC_FPS 覆盖）。
+        // 原实现每轮固定 sleep 500ms，实际帧率 = 1/(0.5s + 采集编码耗时)， negotiated fps 形同虚设；
+        // 改为「到点出帧」：每轮结束算出下一帧截止时刻，sleep 只补足剩余预算——
+        // 采集/编码慢时自然降帧（不叠加延迟），机器空闲时贴合目标帧率。
+        let interval_ms = rc_frame_interval_ms();
+        if interval_ms <= 500 {
+            eprintln!("[agent] 远控帧率目标 {} fps（间隔预算 {}ms；YUDUAN_RC_FPS 可调）",
+                1000 / interval_ms.max(1), interval_ms);
+        } else {
+            eprintln!("[agent] 远控帧率目标 {:.1} fps（间隔预算 {}ms；YUDUAN_RC_FPS 可调）",
+                1000.0 / interval_ms as f64, interval_ms);
+        }
+        let mut next_tick = Instant::now() + Duration::from_millis(interval_ms);
+        let mut cost_acc = Duration::from_millis(0);
         // 代次守卫：新会话开始或 stop 后，旧帧循环立即退出（不残留）。
         while RC_GEN.load(Ordering::SeqCst) == gen && !RC_STOP.load(Ordering::SeqCst) {
-            thread::sleep(Duration::from_millis(500));
+            let now = Instant::now();
+            if next_tick > now {
+                thread::sleep(next_tick - now);
+            }
+            let tick = Instant::now();
+            next_tick = tick + Duration::from_millis(interval_ms);
             if RC_GEN.load(Ordering::SeqCst) != gen || RC_STOP.load(Ordering::SeqCst) {
                 break;
             }
@@ -626,8 +675,13 @@ pub fn start_rc(writer: Writer, rng: Arc<Mutex<crate::Lcg>>, seq: Arc<Mutex<u64>
                 (data, w, h)
             };
             // 二进制媒体环（§8.3）：已协商通道 → 按协商 codec 编码采集帧 → 二进制帧。
-            match send_media_frame(&writer, &data, w, h, frame_seq, started.elapsed().as_millis() as u32) {
+            match send_media_frame(&writer, &data, w, h, frame_seq, started.elapsed().as_millis() as u32, raw_mode) {
                 SendOutcome::Sent => continue,
+                SendOutcome::Recapture => {
+                    // 采集早于协商：本帧丢弃（不回退、不清通道），下一轮按已协商 codec 重采。
+                    frame_seq -= 1; // 不计入有效帧序号
+                    continue;
+                }
                 SendOutcome::Broken => {
                     // 通道损坏：清空回退 JSON 中继（会话不中断）
                     *RC_MEDIA.lock().unwrap() = None;
@@ -654,9 +708,31 @@ pub fn start_rc(writer: Writer, rng: Arc<Mutex<crate::Lcg>>, seq: Arc<Mutex<u64>
                 eprintln!("[agent] rc_frame 发送失败: {}", e);
                 break;
             }
+            // 出帧成本统计：每 30 帧打印一次实际平均帧率与单帧成本，便于判断
+            // 目标帧率是否可达（采集/编码慢时自动降帧，不叠加延迟）。
+            cost_acc += tick.elapsed();
+            if frame_seq % 30 == 0 {
+                let cost = cost_acc.as_secs_f64() / 30.0;
+                eprintln!(
+                    "[agent] 远控帧统计 seq={} 单帧成本 {:.0}ms 实际 {:.1}fps（目标 {}ms/帧）",
+                    frame_seq, cost * 1000.0, 1.0 / cost.max(1e-6), interval_ms
+                );
+                cost_acc = Duration::from_millis(0);
+            }
         }
         eprintln!("[agent] rc 会话结束 {}", session_id);
     });
+}
+
+/// 远控目标帧间隔（ms）：capabilities.fps → 1000/fps；YUDUAN_RC_FPS 可覆盖。
+/// 下限 1ms 防零除/忙轮询；帧循环按此预算做开销补偿式休眠。
+fn rc_frame_interval_ms() -> u64 {
+    let fps = std::env::var("YUDUAN_RC_FPS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or_else(|| crate::rc_media::default_capabilities().fps.max(1) as u64);
+    (1000 / fps).max(1)
 }
 
 pub fn stop_rc() {
@@ -1627,6 +1703,25 @@ mod tests {
         assert_eq!(j.get("format").and_then(|v| v.as_str()), Some("jpeg"));
         let b64 = j.get("data").and_then(|v| v.as_str()).unwrap();
         assert_eq!(base64_decode(b64).unwrap(), data);
+    }
+
+    #[test]
+    fn rc_frame_interval_obeys_env_and_default() {
+        // 默认帧率来自 capabilities.fps（15 → 66ms/帧），环境变量可覆盖，非法值回退默认。
+        std::env::remove_var("YUDUAN_RC_FPS");
+        let d = rc_frame_interval_ms();
+        assert_eq!(d, 1000 / 15, "默认应取 capabilities.fps");
+        std::env::set_var("YUDUAN_RC_FPS", "10");
+        assert_eq!(rc_frame_interval_ms(), 100);
+        std::env::set_var("YUDUAN_RC_FPS", "0");
+        assert_eq!(rc_frame_interval_ms(), d, "非法值应回退默认");
+        std::env::set_var("YUDUAN_RC_FPS", "abc");
+        assert_eq!(rc_frame_interval_ms(), d, "非数字应回退默认");
+        std::env::remove_var("YUDUAN_RC_FPS");
+        // 上限保护：极大 fps 不至于除零/忙轮询
+        std::env::set_var("YUDUAN_RC_FPS", "1000000");
+        assert_eq!(rc_frame_interval_ms(), 1);
+        std::env::remove_var("YUDUAN_RC_FPS");
     }
 
     #[test]

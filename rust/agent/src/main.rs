@@ -1422,9 +1422,71 @@ fn main() {
         match session(&url) {
             Ok(_) => {}
             Err(e) => {
-                eprintln!("[agent] 会话异常: {}，5s 后重连（复用 token）", e);
+                eprintln!("[agent] 会话异常: {}，重连（带抖动退避，复用 token）", e);
             }
         }
-        thread::sleep(Duration::from_secs(5));
+        // 重连退避 + 抖动（§：规模容量）：固定 5s 会在中枢重启/开机风暴时造成
+        // 惊群——2000 台同一秒重试必然再撞 listen backlog（macOS 实测瞬时并发
+        // 超 ~128 个握手就被 reset）。这里 3~9s 抖动 randomization 摊开峰值。
+        thread::sleep(Duration::from_secs_f64(reconnect_delay_secs()));
+    }
+}
+
+/// 重连退避秒数：3s 基础 + 0~6s 抖动（微秒级熵取自系统时钟，无第三方依赖）。
+fn reconnect_delay_secs() -> f64 {
+    let base = std::env::var("YUDUAN_RECONNECT_BASE_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .filter(|v| *v > 0.0)
+        .unwrap_or(3.0);
+    let jitter = std::env::var("YUDUAN_RECONNECT_JITTER_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .filter(|v| *v >= 0.0)
+        .unwrap_or(6.0);
+    // 熵源说明：macOS 的 SystemTime 亚秒位并非纳秒级（低位常被量化），直接取
+    // `subsec_nanos % 1000` 会拿到恒零的二进制低位。故先乘一个大质数做位混合，
+    // 再取模——只要时钟有毫秒级以上变化，结果就会均匀铺开。
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0) as u64;
+    let frac = ((nanos.wrapping_mul(2654435761)) % 1_000_000) as f64 / 1_000_000.0;
+    base + frac * jitter
+}
+
+#[cfg(test)]
+mod stress_tests {
+    use super::reconnect_delay_secs;
+
+    #[test]
+    fn reconnect_backoff_is_jittered_and_configurable() {
+        // 固定退避会在大规模重连时惊群（实测 2000 台瞬时重连会撞 listen backlog），
+        // 故退避必须落在一个区间内而非定值；区间由环境变量可配。
+        std::env::remove_var("YUDUAN_RECONNECT_BASE_SECS");
+        std::env::remove_var("YUDUAN_RECONNECT_JITTER_SECS");
+        let mut vals = Vec::new();
+        for _ in 0..8 {
+            let d = reconnect_delay_secs();
+            assert!(d >= 3.0 && d <= 9.0, "默认退避应落在 3~9s，实际 {}", d);
+            vals.push(d);
+            // 抖动取自系统时钟微秒位：取样间隔需大于时钟分辨率才能观察到变化
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        // 抖动必须真的变化（否则等于固定退避）
+        assert!(
+            vals.windows(2).any(|w| (w[0] - w[1]).abs() > 1e-9),
+            "退避应有抖动"
+        );
+
+        std::env::set_var("YUDUAN_RECONNECT_BASE_SECS", "1");
+        std::env::set_var("YUDUAN_RECONNECT_JITTER_SECS", "0");
+        let mut ok = true;
+        for _ in 0..5 {
+            ok = ok && (reconnect_delay_secs() - 1.0).abs() < 1e-9;
+        }
+        assert!(ok, "抖动置 0 时应等于基础值");
+        std::env::remove_var("YUDUAN_RECONNECT_BASE_SECS");
+        std::env::remove_var("YUDUAN_RECONNECT_JITTER_SECS");
     }
 }

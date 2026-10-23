@@ -159,7 +159,7 @@
 主端 rc_request ──► 被控端 start_rc：合规提示 + rc_ready + rc_capabilities（扁平载荷）
 主端 ◄── 能力告知后回 rc_select{codec, transport, media_addr?}
 被控端 handle_rc_select：clamp 协商 codec →（p2p）dial_direct(media_addr) /（relay）二进制 WS 通道
-帧循环（500ms）：capture → 按协商 codec 编码 → encode_frame → send_frame(TCP) / 二进制 WS 帧
+帧循环（可变帧率，§8.3.8）：capture → 按协商 codec 编码 → encode_frame → send_frame(TCP) / 二进制 WS 帧
 主端 ◄── 二进制帧（hub 对 0x2 opcode 双向透传，不解内容）
 任一端 rc_stop ──► 会话结束（清通道、drop 直连）
 ```
@@ -182,14 +182,40 @@
 - **ICE-lite 候选交换（已接入并实测）**：主端（p2pviewer）按监听绑定方式生成候选——具体 IP 绑定 → 唯一候选；通配绑定（0.0.0.0/::）→ 枚举非回送网卡 IPv4 + 监听端口；`rc_offer`（批量）+ `rc_candidate`（增量）经中枢中继。被控端 `try_candidate`：仅 `RC_WANT_P2P` 且尚无 P2P 通道时逐个 dial，成功即替换通道（保留协商 codec）并发 `media_selected`。实测两型：具体绑定候选 `127.0.0.1:port` 升级成功；通配绑定候选 `192.168.0.109:port`（LAN IP）升级成功。
 - **原生编码器 C-ABI（已端到端验证：桩 + 真实 VideoToolbox 库）**：
   - 验证桩：`dev/fixtures/yuduan_enc_stub.c`（仅接受 h264，输出 `"STUB"`+RGBA），对端校验载荷首 4 字节 `STUB`、总长 = 宽×高×4+4，3 帧全过。
-  - **真实库**：`dev/encoder-vt/`（macOS VideoToolbox 后端，`build.sh` 构建）。要点：H.264 强制软件编码器（部分机器 HW 冷启动病态缓慢）；`create()` 内编码黑帧**预热**并捕获参数集（H.264: SPS/PPS；HEVC: VPS/SPS/PPS），参数集随首个真实输出前置、该输出强制 IDR（码流自首帧可解码）；每次编码经 `sourceFrameRefCon` 携带请求代次，**迟到回调按代次丢弃**（防预热超时后的过期输出污染当前帧）。
-  - **实测（macOS，真实 HEVC）**：能力宣告 `codecs=[raw_rgba,jpeg,h265]`（h264 探测失败不虚标——本机 H.264 编码器服务当时故障，属诚实行为）；协商 h265 → RGBA 采集 3584×2240 → 降采样 1728×1080 → VT 编码 → 二进制帧：首帧 146,982 B = Annex-B + VPS（`00 00 00 01 40...`），后续 P 帧 3.5~5.9 KB（真实压缩特征，对比 RAW 7.46MB/帧），4 帧全过。探测失败的 codec 诚实回退 JPEG 并告知。
+  - **真实库**：`dev/encoder-vt/`（macOS VideoToolbox 后端，`build.sh` 构建）。出帧模型与参数集处理要求见 §8.3.8（2026-10-24 夜间修正：H.264 可用、P 帧生效、帧率提升 5 倍）。
+  - **实测（macOS，真实 HEVC/H.264）**：能力宣告 `codecs=[raw_rgba,jpeg,h264,h265]`；协商后 → RGBA 采集 3584×2240 → 降采样 1728×1080 → VT 编码 → 二进制帧：首帧为 Annex-B 参数集 + IDR（H.264 `00 00 00 01 27...` / HEVC `00 00 00 01 40...`），后续 P 帧 0.7~24 KB（对比 RAW 7.46MB/帧）。探测失败的 codec 诚实回退 JPEG 并告知（不虚标）。
   - 副端探测结果进程级缓存（`native_probe_cached`）——异常编码器服务下单次探测可达数十秒，不重复惩罚。
 - **原生码流解码渲染（浏览器参考台已接 WebCodecs）**：`rc.html` 对 h264/h265/vp8/vp9/av1 帧走 `VideoDecoder`（Annex-B 拆 NAL → avcC description（SPS/PPS）→ 4 字节长度前缀送 `EncodedVideoChunk` → `VideoFrame` 绘 canvas）；`VideoDecoder` 不可用/configure/decode 失败自动回退帧统计。NAL 拆分/avcC 组包/AVCC 转换经合成 Annex-B 流（SPS+PPS+IDR）逐字节验证。
 
 #### 8.3.7 仍缺（生产化最后段）
 
-- **其他平台真实编码器**：Linux（VAAPI 或 x264/x265）、Windows（Media Foundation）按 §8.3.3 契约供给动态库即可（macOS VideoToolbox 已落地，见 §8.3.6）。
+- **其他平台真实编码器**：Linux（VAAPI 或 x264/x265）、Windows（Media Foundation）按 §8.3.4 契约供给动态库即可（macOS VideoToolbox 已落地，见 §8.3.6 / §8.3.8）。
 - **Linux/Windows 实跑**：采集（X11/GDI）与输入注入（XTest/SendInput）分支已写，需对应机器实测；本机（macOS）已全量验证。
-- **媒体环性能（降采样已生效，余自适应）**：RAW/原生路径已按 `capabilities.max_w/h` 保比取偶降采样（5K 屏 RAW 从 32MB/帧降至 7.5MB/帧，实测 1728×1080）；HEVC P 帧 ~4KB/帧。仍缺：可变帧率与带宽自适应、JPEG 工具链路径降采样（当前全分辨率）。
+- **带宽自适应**：可变帧率已落地（§8.3.8），仍缺按网络/RTT 动态调 fps 与码率的闭环（当前 fps 静态来自 `capabilities.fps` 或 `YUDUAN_RC_FPS`）。
+- **JPEG 工具链路径降采样**：当前仍按屏幕全分辨率采集（JPEG 侧未走 `fit_dims`）。
 - **录像留存**：§5 加密录像留存策略待产品决策后实现。
+
+#### 8.3.8 真实原生编码器量产级修正 + 可变帧率（2026-10-24 夜间，端到端已验证）
+
+**VideoToolbox 出帧模型（新动态库必须遵守，否则库在系统中表现为"卡住"或"带宽暴涨"）**：
+
+| 现象（macOS 实测） | 根因 | 要求做法 |
+|---|---|---|
+| 提交第 N 帧后同步等它自己的回调，**永不返回**（90s 亦如此） | VT 会话固定 **1 帧管线延迟**：第 N-1 帧的输出是在提交第 N 帧时才被"顶"出来 | 采用队列：回调入队，`encode()` 取队首；输出比输入滞后 1 帧 |
+| 每帧调用 `VTCompressionSessionCompleteFrames` 兜底 → **每帧 IDR**（20~40KB/帧） | CompleteFrames 会把被推出的帧**强制成关键帧** | 仅在管线饥饿（超时未出帧，如首帧/断流重启）时兜底一次；稳态不 flush |
+| 软件 H.264（`EnableHardwareAcceleratedVideoEncoder=false`）会话**不回调** | 本机软编路径异常 | 默认不指定编码器规格（系统启发式）；`YUDUAN_ENC_HW=0/1` 仅作排障旋钮 |
+
+- **会话预置（prime）**：`create()` 提交两帧黑帧——第 2 帧顶出第 1 帧的输出，借此① 吸收冷启动；② 校验该 codec 真能出码流并取到参数集（`create()` 失败即能力不宣告，不虚标）；③ 第 2 帧的输出留在队列，成为码流首个关键帧。副作用：码流开头有 1 帧黑 IDR（含参数集，解码器可立即起播），属预期行为。
+- **参数集**：从输出样缓冲的 `CMFormatDescription` 提取（H.264 SPS/PPS；HEVC VPS/SPS/PPS），**随同步样（关键帧）前置**，保证中途接入的解码器可起播。
+- **重投语义**：caller 缓冲不足返回 0 时，该帧保留在 `pending`，扩张后的重试交付**同一帧**（不重复编码、不乱序）。
+- **载荷种类守卫（首帧竞态修复）**：帧循环可能在 `rc_select` 到达前采到 JPEG。此时若直接送 H.264 编码器，缓冲区扩张到 4 倍仍不可能成功。约定：通道 codec 与载荷种类不符时返回 `Recapture`——丢弃本帧**不清通道**（区别于 `Broken`），下一轮按已协商 codec 重采。此前靠帧循环首轮 `sleep(500ms)` 侥幸避开该竞态，可变帧率上线后立即暴露。
+- **可变帧率（§8.3.7 性能项关闭）**：帧目标取 `capabilities.fps`（默认 15，`YUDUAN_RC_FPS` 可覆盖）→ 每帧预算 `1000/fps` ms；每轮结束算下一次截止时刻，休眠只补足剩余预算——采集/编码慢时自然降帧而不叠加延迟。每 30 帧输出「单帧成本 / 实际 fps」便于判断目标是否可达。
+- **实测（macOS 本机，2026-10-24）**：
+
+| 项 | 修正前 | 修正后 |
+|---|---|---|
+| h264 / h265 真实码流 | 全帧 IDR（30~40KB/帧） | 首帧 IDR + P 帧（0.7~24KB） |
+| 端到端实测帧率 | 1.9 fps（固定 sleep 500ms） | 9.4 fps（15 fps 目标，受采集成本限制） |
+| 8 帧总带宽（1920×1080 级） | 240,975 B | 222,141 B（含首帧内容帧 210KB；稳态 P 帧 2KB 级） |
+
+- **可复现 fixture**：`dev/encoder-vt/harness.c`（直测 C-ABI，合成渐变+运动方块内容 → 裸流）、`dev/encoder-vt/annexb_stat.py`（Annex-B 切分 + NAL 类型 + ffprobe 交叉验证）、`dev/e2e_vt_encoder.py`（中枢+副端+viewer 全链路，含 ffmpeg 全帧零错误解码校验）。三者均要求：`00 00 00 01` 起始码、无空 NAL、参数集在位、ffmpeg 解码无错、关键帧比例正常。

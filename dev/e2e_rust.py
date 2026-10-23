@@ -12,11 +12,14 @@ RUST = "/Users/huluobo/WorkBuddy/jiankong/rust/agent"
 HUB = os.path.join(DEV, "bin", "hub")
 AGENT = os.path.join(RUST, "target", "agent")
 SECRET = "e2e-secret"
+# 端口可通过环境变量绕开（本机 8080 常被 Docker Desktop 占用，硬编码会让整轮 e2e 假失败）。
+PORT = os.environ.get("YUDUAN_E2E_PORT", "8080")
+BASE = "http://127.0.0.1:" + PORT
 NEW_PW = "Admin@2026x"
 
 os.makedirs(os.path.join(DEV, "certs"), exist_ok=True)
 
-def http_get(path, token=None, base="http://127.0.0.1:8080"):
+def http_get(path, token=None, base=BASE):
     req = urllib.request.Request(base + path)
     if token:
         req.add_header("Authorization", "Bearer " + token)
@@ -32,7 +35,7 @@ def http_get(path, token=None, base="http://127.0.0.1:8080"):
     except Exception as e:
         return -1, {"error": str(e)}
 
-def http_post(path, data, token=None, base="http://127.0.0.1:8080"):
+def http_post(path, data, token=None, base=BASE):
     req = urllib.request.Request(base + path, data=json.dumps(data).encode(),
                                  headers={"Content-Type": "application/json"})
     if token:
@@ -61,7 +64,7 @@ def http_upload(path, file_path, fields, token):
                  "Content-Type: application/octet-stream\r\n\r\n" % (boundary, fname)).encode()
         body += f.read()
     body += ("\r\n--%s--\r\n" % boundary).encode()
-    req = urllib.request.Request("http://127.0.0.1:8080" + path, data=body,
+    req = urllib.request.Request(BASE + path, data=body,
                                  headers={"Content-Type": "multipart/form-data; boundary=%s" % boundary,
                                           "Authorization": "Bearer " + token})
     try:
@@ -167,7 +170,8 @@ def build_rust():
         subprocess.run(["rustc", "-O", "src/main.rs", "-o", "target/agent"], cwd=RUST, check=True)
 
 def start_hub():
-    env = dict(os.environ, YUDUAN_HMAC_SECRET=SECRET, YUDUAN_REPO="/tmp/yuduan-rust-e2e-repo")
+    env = dict(os.environ, YUDUAN_HMAC_SECRET=SECRET, YUDUAN_REPO="/tmp/yuduan-rust-e2e-repo",
+               YUDUAN_HUB_ADDR=":" + PORT)
     return subprocess.Popen([HUB], cwd=DEV, env=env,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 
@@ -201,7 +205,7 @@ TOKEN = body.get("token") or TOKEN
 check("admin 改密换令牌", st == 200 and bool(body.get("token")))
 
 # 2) ws 明文 + HMAC 互通：注册 → shell 指令
-agent = start_agent("ws://127.0.0.1:8080/ws/agent")
+agent = start_agent(f"ws://127.0.0.1:{PORT}/ws/agent")
 dev = wait_rust_device(TOKEN)
 check("Rust 副端(ws)注册成功", dev is not None, f"device={dev['id'] if dev else None}")
 DEVID = dev["id"] if dev else None
@@ -224,7 +228,7 @@ if DEVID:
     check("软件仓库上传成功", st == 200 and bool(sw_id), f"id={sw_id}")
     if sw_id:
         st, b = http_post(f"/api/v1/devices/{DEVID}",
-                          {"action": "sw_install", "software_url": f"http://127.0.0.1:8080/api/v1/repo/{sw_id}",
+                          {"action": "sw_install", "software_url": f"{BASE}/api/v1/repo/{sw_id}",
                            "platform": "macos", "pkg_name": "e2e-tool"}, token=TOKEN)
         check("Rust 副端 sw_install 下载+解包", isinstance(b, dict) and b.get("state") == "success",
               f"state={b.get('state')} out={b.get('output_log','')[:80]}")
@@ -232,7 +236,7 @@ if DEVID:
 # 4) HMAC 拒签：错误密钥 → 指令被拒（回执 failed，不执行）
 agent.terminate(); agent.wait()
 time.sleep(0.5)
-agent_bad = start_agent("ws://127.0.0.1:8080/ws/agent", secret="WRONG-SECRET")
+agent_bad = start_agent(f"ws://127.0.0.1:{PORT}/ws/agent", secret="WRONG-SECRET")
 dev2 = wait_rust_device(TOKEN)
 if dev2:
     st, b = http_post(f"/api/v1/devices/{dev2['id']}",
@@ -256,7 +260,7 @@ if dev3:
 # 6) M4 远控：viewer → rc_request → rc_ready（+rc_frame 若沙箱允许采集）→ rc_input → rc_stop
 if dev3:
     try:
-        v = WSClient("127.0.0.1", 8080, "/ws/viewer")
+        v = WSClient("127.0.0.1", int(PORT), "/ws/viewer")
         v.send_text(json.dumps({"type": "rc_request", "payload": {
             "device_id": dev3["id"], "session_id": "e2e-rc-1", "operator": "admin"}}))
         ready = frame = event = None
