@@ -1,13 +1,18 @@
 // Package proto 定义御端控制面消息信封与各类载荷，对齐 dev/proto/protocol.md（M1 冻结 v1）。
 package proto
 
-import "encoding/json"
+import (
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+)
 
 // Ver 为当前协议版本，与 protocol.md 保持一致。
 const Ver = 1
 
 // Envelope 是 WebSocket 控制消息的统一信封（JSON）。
-// 关键指令由服务端签名，Agent 验签；心跳/回执类携带有效令牌即可。
+// 关键指令由服务端签名（Sig），Agent 验签；心跳/回执类携带有效令牌即可。
+// Nonce 用于防重放，每条消息唯一。
 type Envelope struct {
 	Ver     int             `json:"ver"`
 	MsgID   string          `json:"msg_id"`
@@ -15,6 +20,7 @@ type Envelope struct {
 	Type    string          `json:"type"`
 	Seq     int64           `json:"seq"`
 	Payload json.RawMessage `json:"payload"`
+	Nonce   string          `json:"nonce,omitempty"`
 	Sig     string          `json:"sig,omitempty"`
 }
 
@@ -146,12 +152,14 @@ type ResultPayload struct {
 	OutputLog string `json:"output_log"`
 }
 
-// NewEnvelope 构造一个带版本与消息 ID 的信封。
+// NewEnvelope 构造一个带版本、消息 ID 与唯一 Nonce 的信封。
 func NewEnvelope(msgType string, seq int64, payload any) (Envelope, error) {
 	raw, err := json.Marshal(payload)
 	if err != nil {
 		return Envelope{}, err
 	}
+	nb := make([]byte, 8)
+	rand.Read(nb)
 	return Envelope{
 		Ver:     Ver,
 		MsgID:   newMsgID(),
@@ -159,6 +167,7 @@ func NewEnvelope(msgType string, seq int64, payload any) (Envelope, error) {
 		Type:    msgType,
 		Seq:     seq,
 		Payload: raw,
+		Nonce:   hex.EncodeToString(nb),
 	}, nil
 }
 

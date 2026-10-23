@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>御端 · 管理控制台（M2/M3 演示）</title>
+  <title>御端 · 管理控制台</title>
   <style>
     :root { --bg:#f4f5fa; --card:#ffffff; --line:#e4e7ef; --text:#1f2430; --muted:#6b7280; --brand:#1e3a8a; --ok:#16a34a; --off:#9ca3af; }
     * { box-sizing: border-box; }
@@ -11,6 +11,8 @@
     header { padding:18px 24px; background:var(--brand); color:#fff; display:flex; align-items:center; justify-content:space-between; }
     header h1 { font-size:18px; margin:0; font-weight:600; }
     header .sub { font-size:12px; opacity:.8; }
+    nav { display:flex; gap:14px; align-items:center; }
+    nav a { color:#fff; text-decoration:none; font-size:13px; opacity:.9; }
     main { padding:20px 24px; max-width:1100px; margin:0 auto; }
     .cards { display:flex; gap:14px; margin-bottom:20px; }
     .card { flex:1; background:var(--card); border:1px solid var(--line); border-radius:14px; padding:16px; }
@@ -32,11 +34,12 @@
 </head>
 <body>
   <header>
-    <div><h1>御端 · 管理控制台</h1><div class="sub">企业终端统一管理平台 · M2/M3 演示（局域网）</div></div>
-    <nav style="display:flex;gap:16px;align-items:center;">
-      <a href="/rc.html" style="color:#fff;text-decoration:none;font-size:13px;opacity:.9;">远程控制</a>
-      <a href="/software.html" style="color:#fff;text-decoration:none;font-size:13px;opacity:.9;">软件分发</a>
-      <span class="sub" id="clock"></span>
+    <div><h1>御端 · 管理控制台</h1><div class="sub">企业终端统一管理平台 · <span id="role">角色：-</span></div></div>
+    <nav>
+      <a href="/rc.html">远程控制</a>
+      <a href="/software.html">软件分发</a>
+      <a href="/audit.html">审计日志</a>
+      <a href="#" id="logout">退出</a>
     </nav>
   </header>
   <main>
@@ -62,9 +65,8 @@
     <pre id="resultOut">—</pre>
   </main>
 
+  <script src="auth.js"></script>
   <script>
-    const api = (p) => fetch(p).then(r => r.json());
-
     async function refresh() {
       const [dev, rep] = await Promise.all([api('/api/v1/devices'), api('/api/v1/report')]);
       document.getElementById('total').textContent = rep.total ?? 0;
@@ -89,8 +91,6 @@
       document.getElementById('tableWrap').innerHTML = rows
         ? `<table><thead><tr><th>主机</th><th>OS</th><th>Arch</th><th>CPU</th><th>内存</th><th>磁盘</th><th>IP</th><th>MAC</th><th>Agent</th><th>状态</th></tr></thead><tbody>${rows}</tbody></table>`
         : '<div class="empty">暂无设备，请先启动副端 Agent。</div>';
-
-      document.getElementById('clock').textContent = new Date().toLocaleString('zh-CN');
     }
 
     document.getElementById('sendBtn').onclick = async () => {
@@ -100,10 +100,10 @@
       const out = document.getElementById('resultOut');
       if (!id) { out.textContent = '请先选择设备'; return; }
       out.textContent = '下发中…';
-      const r = await fetch(`/api/v1/devices/${id}/commands`, {
+      const r = await api(`/api/v1/devices/${id}/commands`, {
         method: 'POST', headers: {'Content-Type':'application/json'},
         body: JSON.stringify({ action, command })
-      }).then(r => r.json());
+      }).catch(e => ({error: e.message}));
       out.textContent = JSON.stringify(r, null, 2);
     };
 

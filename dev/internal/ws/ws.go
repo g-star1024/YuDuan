@@ -7,6 +7,7 @@ import (
 	"bufio"
 	"crypto/rand"
 	"crypto/sha1"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/binary"
 	"errors"
@@ -57,26 +58,45 @@ func Upgrade(w http.ResponseWriter, r *http.Request) (*Conn, error) {
 	return &Conn{conn: raw, buf: bufio.NewReader(raw), isClient: false}, nil
 }
 
-// Dial 作为客户端连接 WebSocket 服务端并完成握手。支持 ws://host:port/path。
+// Dial 作为客户端连接 WebSocket 服务端并完成握手。支持 ws:// 与 wss://。
+// wss:// 走标准库 TLS（自签证书场景跳过校验）。
 func Dial(urlStr string) (*Conn, error) {
-	// 解析 ws://host:port/path
-	if !strings.HasPrefix(urlStr, "ws://") {
-		return nil, errors.New("only ws:// supported in M2 PoC")
+	var raw net.Conn
+	var err error
+	var rest, path string
+
+	switch {
+	case strings.HasPrefix(urlStr, "wss://"):
+		rest = strings.TrimPrefix(urlStr, "wss://")
+		path = "/"
+		if idx := strings.Index(rest, "/"); idx >= 0 {
+			path = rest[idx:]
+			rest = rest[:idx]
+		}
+		host := rest
+		if !strings.Contains(host, ":") {
+			host += ":443"
+		}
+		raw, err = tls.Dial("tcp", host, &tls.Config{InsecureSkipVerify: true})
+	case strings.HasPrefix(urlStr, "ws://"):
+		rest = strings.TrimPrefix(urlStr, "ws://")
+		path = "/"
+		if idx := strings.Index(rest, "/"); idx >= 0 {
+			path = rest[idx:]
+			rest = rest[:idx]
+		}
+		host := rest
+		if !strings.Contains(host, ":") {
+			host += ":80"
+		}
+		raw, err = net.Dial("tcp", host)
+	default:
+		return nil, errors.New("url must start with ws:// or wss://")
 	}
-	rest := strings.TrimPrefix(urlStr, "ws://")
-	path := "/"
-	if idx := strings.Index(rest, "/"); idx >= 0 {
-		path = rest[idx:]
-		rest = rest[:idx]
-	}
-	host := rest
-	if !strings.Contains(host, ":") {
-		host += ":80"
-	}
-	netConn, err := net.Dial("tcp", host)
 	if err != nil {
 		return nil, err
 	}
+
 	key := make([]byte, 16)
 	rand.Read(key)
 	handshake := "GET " + path + " HTTP/1.1\r\n" +
@@ -85,31 +105,31 @@ func Dial(urlStr string) (*Conn, error) {
 		"Connection: Upgrade\r\n" +
 		"Sec-WebSocket-Key: " + base64.StdEncoding.EncodeToString(key) + "\r\n" +
 		"Sec-WebSocket-Version: 13\r\n\r\n"
-	if _, err := netConn.Write([]byte(handshake)); err != nil {
-		netConn.Close()
+	if _, err := raw.Write([]byte(handshake)); err != nil {
+		raw.Close()
 		return nil, err
 	}
-	br := bufio.NewReader(netConn)
+	br := bufio.NewReader(raw)
 	statusLine, err := br.ReadString('\n')
 	if err != nil {
-		netConn.Close()
+		raw.Close()
 		return nil, err
 	}
 	if !strings.Contains(statusLine, "101") {
-		netConn.Close()
+		raw.Close()
 		return nil, errors.New("handshake failed: " + strings.TrimSpace(statusLine))
 	}
 	for {
 		line, err := br.ReadString('\n')
 		if err != nil {
-			netConn.Close()
+			raw.Close()
 			return nil, err
 		}
 		if line == "\r\n" || line == "\n" {
 			break
 		}
 	}
-	return &Conn{conn: netConn, buf: br, isClient: true}, nil
+	return &Conn{conn: raw, buf: br, isClient: true}, nil
 }
 
 // ReadMessage 读取一帧文本消息；自动处理 ping/pong/close。

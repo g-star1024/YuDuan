@@ -1,6 +1,8 @@
 // Package hub 实现御端服务端中枢。
-// 职责：Agent 长连接纳管（注册/心跳/指令结果）、管理 REST API、远程控制信令与画面中继（M4）、
-// 软件仓库与分发（M5）、资产台账与报表。存储当前为内存实现，接口化便于后续接入 PostgreSQL。
+// 职责：Agent 长连接纳管（注册/心跳/指令结果）、管理 REST API（RBAC 门禁 + 审计）、
+// 远程控制信令与画面中继（M4）、软件仓库与分发（M5）、资产台账与报表。
+// M6 新增：登录鉴权 / RBAC 接口门禁 / 审计落库 / AD-LDAP 目录同步。
+// 安全基座：关键指令 HMAC 签名（副端验签）；TLS 由入口层（cmd/hub）承载。
 package hub
 
 import (
@@ -16,6 +18,10 @@ import (
 	"sync"
 	"time"
 
+	"yuduan/internal/audit"
+	"yuduan/internal/auth"
+	"yuduan/internal/crypto"
+	"yuduan/internal/directory"
 	"yuduan/internal/proto"
 	"yuduan/internal/store"
 	"yuduan/internal/ws"
@@ -31,30 +37,67 @@ type RCSession struct {
 	Consent   bool
 }
 
+// HubConfig 是中枢的可选配置；缺省项自动回退到内存实现。
+type HubConfig struct {
+	RepoDir     string
+	Store       store.Store
+	Auditor     audit.Auditor
+	Users       auth.UserStore
+	Auth        *auth.AuthService
+	HMACSecret  string
+	HMACEnforce bool
+	DirSync     *directory.SyncEngine
+}
+
 // Hub 是中枢核心结构。
 type Hub struct {
-	store    *store.MemStore
+	store    store.Store
+	auditor  audit.Auditor
+	users    auth.UserStore
+	authSvc  *auth.AuthService
+	secret   string
+	enforce  bool
+	dirSync  *directory.SyncEngine
+
 	mu       sync.Mutex
-	conns    map[string]*ws.Conn        // deviceID -> 控制面长连接
+	conns    map[string]*ws.Conn   // deviceID -> 控制面长连接
 	pending  map[string]chan proto.ResultPayload
-	sessions map[string]*RCSession      // deviceID -> 远控会话
+	sessions map[string]*RCSession // deviceID -> 远控会话
 	software map[string]*proto.SoftwareItem
 	repoDir  string
 }
 
-// NewHub 构造中枢。repoDir 为软件仓库落盘目录。
-func NewHub(repoDir string) *Hub {
-	if repoDir == "" {
-		repoDir = "data/repo"
+// NewHub 构造中枢，缺省回退到内存实现。
+func NewHub(cfg HubConfig) *Hub {
+	if cfg.RepoDir == "" {
+		cfg.RepoDir = "data/repo"
 	}
-	_ = os.MkdirAll(repoDir, 0o755)
+	if cfg.Store == nil {
+		cfg.Store = store.NewMemStore()
+	}
+	if cfg.Auditor == nil {
+		cfg.Auditor = audit.NewMemAuditor()
+	}
+	if cfg.Users == nil {
+		cfg.Users = store.NewMemUserStore()
+	}
+	if cfg.Auth == nil {
+		cfg.Auth = auth.NewAuthService(cfg.Users, cfg.HMACSecret, "")
+	}
+	_ = os.MkdirAll(cfg.RepoDir, 0o755)
 	return &Hub{
-		store:    store.NewMemStore(),
+		store:    cfg.Store,
+		auditor:  cfg.Auditor,
+		users:    cfg.Users,
+		authSvc:  cfg.Auth,
+		secret:   cfg.HMACSecret,
+		enforce:  cfg.HMACEnforce,
+		dirSync:  cfg.DirSync,
 		conns:    make(map[string]*ws.Conn),
 		pending:  make(map[string]chan proto.ResultPayload),
 		sessions: make(map[string]*RCSession),
 		software: make(map[string]*proto.SoftwareItem),
-		repoDir:  repoDir,
+		repoDir:  cfg.RepoDir,
 	}
 }
 
@@ -63,13 +106,66 @@ func (h *Hub) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws/agent", h.handleAgentWS)
 	mux.HandleFunc("/ws/viewer", h.handleViewerWS)
-	mux.HandleFunc("/api/v1/devices", h.handleDevices)
-	mux.HandleFunc("/api/v1/report", h.handleReport)
-	mux.HandleFunc("/api/v1/software", h.handleSoftware)
-	mux.HandleFunc("/api/v1/repo/", h.handleRepo)
-	mux.HandleFunc("/api/v1/devices/", h.handleDeviceByID)
+	// 公开
+	mux.HandleFunc("/api/v1/login", h.handleLogin)
+	// 受保护：资产
+	mux.HandleFunc("/api/v1/devices", h.guard(auth.PermDeviceView, h.handleDevices))
+	mux.HandleFunc("/api/v1/report", h.guard(auth.PermDeviceView, h.handleReport))
+	mux.HandleFunc("/api/v1/devices/", h.guardDeviceByID)
+	// 受保护：软件仓库
+	mux.HandleFunc("/api/v1/software", h.guardSoftware)
+	mux.HandleFunc("/api/v1/repo/", h.handleRepo) // 副端下载（演示放开；生产应短令牌/鉴权）
+	// 受保护：审计 / 目录同步
+	mux.HandleFunc("/api/v1/audit", h.guard(auth.PermAuditView, h.handleAudit))
+	mux.HandleFunc("/api/v1/dirsync", h.guard(auth.PermDirSync, h.handleDirSync))
 	mux.HandleFunc("/", h.handleConsole)
 	return mux
+}
+
+// guard 包裹受保护接口：校验 Bearer 令牌并判定角色权限。
+func (h *Hub) guard(perm string, fn func(http.ResponseWriter, *http.Request, crypto.Claims)) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		claims, err := h.authSvc.VerifyToken(auth.TokenFromHeader(r.Header.Get("Authorization")))
+		if err != nil {
+			writeErr(w, 401, "unauthorized")
+			return
+		}
+		if !h.authSvc.HasPerm(claims.Role, perm) {
+			writeErr(w, 403, "forbidden: 需要权限 "+perm)
+			return
+		}
+		fn(w, r, claims)
+	}
+}
+
+// guardDeviceByID 根据子路径选择所需权限（GET 查看 / POST 指令）。
+func (h *Hub) guardDeviceByID(w http.ResponseWriter, r *http.Request) {
+	switch {
+	case r.Method == http.MethodGet:
+		h.guard(auth.PermDeviceView, h.handleDeviceGet).ServeHTTP(w, r)
+	case r.Method == http.MethodPost:
+		h.guard(auth.PermDeviceCmd, h.handleDeviceCmd).ServeHTTP(w, r)
+	default:
+		http.NotFound(w, r)
+	}
+}
+
+func (h *Hub) guardSoftware(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		h.guard(auth.PermDeviceView, h.handleSoftwareList).ServeHTTP(w, r)
+	case http.MethodPost:
+		h.guard(auth.PermSoftwareMgmt, h.handleSoftwareUpload).ServeHTTP(w, r)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// audit 写入一条审计记录。
+func (h *Hub) audit(actor, action, target, detail, result string) {
+	if h.auditor != nil {
+		h.auditor.Record(audit.Event{Actor: actor, Action: action, Target: target, Detail: detail, Result: result})
+	}
 }
 
 // StartReaper 定期检查心跳超时，将超过 90s 未心跳的设备标记为离线。
@@ -84,6 +180,43 @@ func (h *Hub) StartReaper() {
 			}
 		}
 	}
+}
+
+// RunDirSync 执行一次目录同步并写审计。
+func (h *Hub) RunDirSync(actor string) (interface{}, error) {
+	if h.dirSync == nil {
+		return nil, nil
+	}
+	res, err := h.dirSync.Sync()
+	if err != nil {
+		h.audit(actor, "dir_sync", "", "同步失败: "+err.Error(), "failed")
+		return nil, err
+	}
+	h.audit(actor, "dir_sync", "", "同步用户数="+itoa(res.UsersSynced), "success")
+	return res, nil
+}
+
+// ---- 登录 ----
+
+func (h *Hub) handleLogin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var body struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	token, err := h.authSvc.Login(body.Username, body.Password)
+	if err != nil {
+		h.audit(body.Username, "login", "", "登录失败", "failed")
+		writeErr(w, 401, "invalid credentials")
+		return
+	}
+	claims, _ := h.authSvc.VerifyToken(token)
+	h.audit(body.Username, "login", "", "角色="+claims.Role, "success")
+	writeJSON(w, map[string]any{"code": 0, "token": token, "role": claims.Role})
 }
 
 // ---- Agent 长连接 ----
@@ -149,14 +282,12 @@ func (h *Hub) handleAgentWS(w http.ResponseWriter, r *http.Request) {
 			}
 			log.Printf("[hub] result task=%s state=%s exit=%d", p.TaskID, p.State, p.ExitCode)
 
-		// —— M4 远控：被控端回报，中继给 viewer ——
 		case proto.TypeRCReady, proto.TypeRCFrame, proto.TypeRCEvent:
 			h.relayToViewer(deviceID, raw)
 		case proto.TypeRCStop:
 			h.endSession(deviceID)
 
 		default:
-			// ack / event 等暂不处理
 		}
 	}
 
@@ -170,7 +301,6 @@ func (h *Hub) handleAgentWS(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// relayToViewer 将以 deviceID 关联的远控会话画面/事件转发给 viewer。
 func (h *Hub) relayToViewer(deviceID string, raw []byte) {
 	h.mu.Lock()
 	s, ok := h.sessions[deviceID]
@@ -181,7 +311,6 @@ func (h *Hub) relayToViewer(deviceID string, raw []byte) {
 	_ = s.Viewer.WriteMessage(raw)
 }
 
-// endSession 关闭并清理一个远控会话。
 func (h *Hub) endSession(deviceID string) {
 	h.mu.Lock()
 	s, ok := h.sessions[deviceID]
@@ -233,8 +362,8 @@ func (h *Hub) handleViewerWS(w http.ResponseWriter, r *http.Request) {
 			}
 			h.mu.Unlock()
 			deviceID = p.DeviceID
-			// 转发给被控端，开启捕获
 			_ = agentConn.WriteMessage(raw)
+			h.audit(p.Operator, "rc_start", p.DeviceID, "远控会话开启", "success")
 			log.Printf("[hub] rc session start device=%s operator=%s", p.DeviceID, p.Operator)
 
 		case proto.TypeRCInput, proto.TypeRCStop:
@@ -251,18 +380,14 @@ func (h *Hub) handleViewerWS(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// ---- REST 管理 API ----
+// ---- REST 管理 API（受保护）----
 
-func (h *Hub) handleDevices(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
+func (h *Hub) handleDevices(w http.ResponseWriter, r *http.Request, _ crypto.Claims) {
 	list := h.store.List()
 	writeJSON(w, map[string]any{"total": len(list), "devices": list})
 }
 
-func (h *Hub) handleReport(w http.ResponseWriter, r *http.Request) {
+func (h *Hub) handleReport(w http.ResponseWriter, r *http.Request, _ crypto.Claims) {
 	list := h.store.List()
 	online := 0
 	byOS := map[string]int{}
@@ -277,178 +402,125 @@ func (h *Hub) handleReport(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (h *Hub) handleDeviceByID(w http.ResponseWriter, r *http.Request) {
-	trimmed := strings.TrimPrefix(r.URL.Path, "/api/v1/devices/")
-	parts := strings.Split(trimmed, "/")
-	if len(parts) == 0 || parts[0] == "" {
+func (h *Hub) handleDeviceGet(w http.ResponseWriter, r *http.Request, _ crypto.Claims) {
+	id := deviceIDFromPath(r.URL.Path)
+	dev, ok := h.store.Get(id)
+	if !ok {
 		http.NotFound(w, r)
 		return
 	}
-	id := parts[0]
-
-	if r.Method == http.MethodGet && len(parts) == 1 {
-		dev, ok := h.store.Get(id)
-		if !ok {
-			http.NotFound(w, r)
-			return
-		}
-		writeJSON(w, dev)
-		return
-	}
-
-	// POST /api/v1/devices/:id/commands  {action, command, software_url, platform, pkg_name}
-	if r.Method == http.MethodPost && len(parts) == 2 && parts[1] == "commands" {
-		var body struct {
-			Action      string `json:"action"`
-			Command     string `json:"command"`
-			SoftwareURL string `json:"software_url"`
-			Platform    string `json:"platform"`
-			PkgName     string `json:"pkg_name"`
-		}
-		_ = json.NewDecoder(r.Body).Decode(&body)
-
-		h.mu.Lock()
-		conn, ok := h.conns[id]
-		h.mu.Unlock()
-		if !ok {
-			writeErr(w, 2001, "device offline")
-			return
-		}
-		taskID := newTaskID()
-		cmd, _ := proto.NewEnvelope(proto.TypeCommand, 0, proto.CommandPayload{
-			Action: body.Action, TaskID: taskID, Command: body.Command,
-			SoftwareURL: body.SoftwareURL, Platform: body.Platform, PkgName: body.PkgName,
-		})
-		cmdBytes, _ := json.Marshal(cmd)
-		if err := conn.WriteMessage(cmdBytes); err != nil {
-			writeErr(w, 2001, "send failed: "+err.Error())
-			return
-		}
-
-		ch := make(chan proto.ResultPayload, 1)
-		h.mu.Lock()
-		h.pending[taskID] = ch
-		h.mu.Unlock()
-		defer func() {
-			h.mu.Lock()
-			delete(h.pending, taskID)
-			h.mu.Unlock()
-		}()
-
-		timeout := 15 * time.Second
-		if body.Action == "sw_install" {
-			timeout = 120 * time.Second
-		}
-		select {
-		case res := <-ch:
-			writeJSON(w, res)
-		case <-time.After(timeout):
-			writeErr(w, 2001, "command timeout")
-		}
-		return
-	}
-
-	// POST /api/v1/devices/:id/push  {software_id} —— 便捷分发
-	if r.Method == http.MethodPost && len(parts) == 2 && parts[1] == "push" {
-		var body struct {
-			SoftwareID string `json:"software_id"`
-		}
-		_ = json.NewDecoder(r.Body).Decode(&body)
-		h.mu.Lock()
-		item, ok := h.software[body.SoftwareID]
-		conn, online := h.conns[id]
-		h.mu.Unlock()
-		if !ok {
-			writeErr(w, 3001, "software not found")
-			return
-		}
-		if !online {
-			writeErr(w, 2001, "device offline")
-			return
-		}
-		scheme := "http"
-		if r.TLS != nil {
-			scheme = "https"
-		}
-		downloadURL := scheme + "://" + r.Host + "/api/v1/repo/" + item.ID
-		taskID := newTaskID()
-		cmd, _ := proto.NewEnvelope(proto.TypeCommand, 0, proto.CommandPayload{
-			Action: "sw_install", TaskID: taskID, SoftwareURL: downloadURL,
-			Platform: item.Platform, PkgName: item.FileName,
-		})
-		cmdBytes, _ := json.Marshal(cmd)
-		if err := conn.WriteMessage(cmdBytes); err != nil {
-			writeErr(w, 2001, "send failed: "+err.Error())
-			return
-		}
-		writeJSON(w, map[string]any{"code": 0, "task_id": taskID, "message": "分发任务已下发", "download_url": downloadURL})
-		return
-	}
-
-	http.NotFound(w, r)
+	writeJSON(w, dev)
 }
 
-// ---- M5 软件仓库 ----
+func (h *Hub) handleDeviceCmd(w http.ResponseWriter, r *http.Request, claims crypto.Claims) {
+	id := deviceIDFromPath(r.URL.Path)
+	var body struct {
+		Action      string `json:"action"`
+		Command     string `json:"command"`
+		SoftwareURL string `json:"software_url"`
+		Platform    string `json:"platform"`
+		PkgName     string `json:"pkg_name"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body)
 
-func (h *Hub) handleSoftware(w http.ResponseWriter, r *http.Request) {
-	if r.Method == http.MethodGet {
-		h.mu.Lock()
-		items := make([]*proto.SoftwareItem, 0, len(h.software))
-		for _, it := range h.software {
-			items = append(items, it)
-		}
-		h.mu.Unlock()
-		writeJSON(w, map[string]any{"total": len(items), "items": items})
+	h.mu.Lock()
+	conn, ok := h.conns[id]
+	h.mu.Unlock()
+	if !ok {
+		writeErr(w, 2001, "device offline")
 		return
 	}
-	if r.Method == http.MethodPost {
-		if err := r.ParseMultipartForm(50 << 20); err != nil {
-			writeErr(w, 3002, "parse form failed: "+err.Error())
-			return
-		}
-		file, header, err := r.FormFile("file")
-		if err != nil {
-			writeErr(w, 3003, "missing file field")
-			return
-		}
-		defer file.Close()
-		name := r.FormValue("name")
-		version := r.FormValue("version")
-		platform := r.FormValue("platform")
-		if name == "" {
-			name = strings.TrimSuffix(header.Filename, filepath.Ext(header.Filename))
-		}
-		if version == "" {
-			version = "1.0.0"
-		}
-		if platform == "" {
-			platform = "any"
-		}
-		id := "sw-" + randHex(8)
-		dst := filepath.Join(h.repoDir, id)
-		out, err := os.Create(dst)
-		if err != nil {
-			writeErr(w, 3004, "save failed: "+err.Error())
-			return
-		}
-		size, err := io.Copy(out, file)
-		out.Close()
-		if err != nil {
-			writeErr(w, 3004, "save failed: "+err.Error())
-			return
-		}
-		item := &proto.SoftwareItem{
-			ID: id, Name: name, Version: version, Platform: platform,
-			FileName: header.Filename, Size: size, UploadedAt: time.Now().Unix(),
-		}
-		h.mu.Lock()
-		h.software[id] = item
-		h.mu.Unlock()
-		log.Printf("[hub] software uploaded: %s v%s (%s) %d bytes", name, version, platform, size)
-		writeJSON(w, map[string]any{"code": 0, "item": item})
+	taskID := newTaskID()
+	cmd, _ := proto.NewEnvelope(proto.TypeCommand, 0, proto.CommandPayload{
+		Action: body.Action, TaskID: taskID, Command: body.Command,
+		SoftwareURL: body.SoftwareURL, Platform: body.Platform, PkgName: body.PkgName,
+	})
+	h.sign(&cmd) // 安全基座：关键指令 HMAC 签名
+	cmdBytes, _ := json.Marshal(cmd)
+	if err := conn.WriteMessage(cmdBytes); err != nil {
+		writeErr(w, 2001, "send failed: "+err.Error())
 		return
 	}
-	http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	h.audit(claims.Username, "command", id, "action="+body.Action+" cmd="+body.Command, "success")
+
+	ch := make(chan proto.ResultPayload, 1)
+	h.mu.Lock()
+	h.pending[taskID] = ch
+	h.mu.Unlock()
+	defer func() {
+		h.mu.Lock()
+		delete(h.pending, taskID)
+		h.mu.Unlock()
+	}()
+
+	timeout := 15 * time.Second
+	if body.Action == "sw_install" {
+		timeout = 120 * time.Second
+	}
+	select {
+	case res := <-ch:
+		writeJSON(w, res)
+	case <-time.After(timeout):
+		writeErr(w, 2001, "command timeout")
+	}
+}
+
+func (h *Hub) handleSoftwareList(w http.ResponseWriter, r *http.Request, _ crypto.Claims) {
+	h.mu.Lock()
+	items := make([]*proto.SoftwareItem, 0, len(h.software))
+	for _, it := range h.software {
+		items = append(items, it)
+	}
+	h.mu.Unlock()
+	writeJSON(w, map[string]any{"total": len(items), "items": items})
+}
+
+func (h *Hub) handleSoftwareUpload(w http.ResponseWriter, r *http.Request, claims crypto.Claims) {
+	if err := r.ParseMultipartForm(50 << 20); err != nil {
+		writeErr(w, 3002, "parse form failed: "+err.Error())
+		return
+	}
+	file, header, err := r.FormFile("file")
+	if err != nil {
+		writeErr(w, 3003, "missing file field")
+		return
+	}
+	defer file.Close()
+	name := r.FormValue("name")
+	version := r.FormValue("version")
+	platform := r.FormValue("platform")
+	if name == "" {
+		name = strings.TrimSuffix(header.Filename, filepath.Ext(header.Filename))
+	}
+	if version == "" {
+		version = "1.0.0"
+	}
+	if platform == "" {
+		platform = "any"
+	}
+	id := "sw-" + randHex(8)
+	dst := filepath.Join(h.repoDir, id)
+	out, err := os.Create(dst)
+	if err != nil {
+		writeErr(w, 3004, "save failed: "+err.Error())
+		return
+	}
+	size, err := io.Copy(out, file)
+	out.Close()
+	if err != nil {
+		writeErr(w, 3004, "save failed: "+err.Error())
+		return
+	}
+	item := &proto.SoftwareItem{
+		ID: id, Name: name, Version: version, Platform: platform,
+		FileName: header.Filename, Size: size, UploadedAt: time.Now().Unix(),
+	}
+	h.mu.Lock()
+	h.software[id] = item
+	h.mu.Unlock()
+	h.audit(claims.Username, "software_upload", id, "name="+name+" v"+version, "success")
+	log.Printf("[hub] software uploaded: %s v%s (%s) %d bytes", name, version, platform, size)
+	writeJSON(w, map[string]any{"code": 0, "item": item})
 }
 
 func (h *Hub) handleRepo(w http.ResponseWriter, r *http.Request) {
@@ -474,12 +546,35 @@ func (h *Hub) handleRepo(w http.ResponseWriter, r *http.Request) {
 	http.ServeFile(w, r, path)
 }
 
+func (h *Hub) handleAudit(w http.ResponseWriter, r *http.Request, _ crypto.Claims) {
+	limit := 100
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if n, err := atoi(v); err == nil && n > 0 {
+			limit = n
+		}
+	}
+	writeJSON(w, map[string]any{"total": h.auditor.AuditCount(), "events": h.auditor.Query(limit)})
+}
+
+func (h *Hub) handleDirSync(w http.ResponseWriter, r *http.Request, claims crypto.Claims) {
+	res, err := h.RunDirSync(claims.Username)
+	if err != nil {
+		writeErr(w, 5001, err.Error())
+		return
+	}
+	writeJSON(w, map[string]any{"code": 0, "result": res})
+}
+
 // ---- 控制台静态页 ----
 
 func (h *Hub) handleConsole(w http.ResponseWriter, r *http.Request) {
 	switch r.URL.Path {
 	case "/", "/index.html":
 		http.ServeFile(w, r, "console/index.html")
+	case "/login.html":
+		http.ServeFile(w, r, "console/login.html")
+	case "/audit.html":
+		http.ServeFile(w, r, "console/audit.html")
 	case "/rc.html":
 		http.ServeFile(w, r, "console/rc.html")
 	case "/software.html":
@@ -489,7 +584,25 @@ func (h *Hub) handleConsole(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// ---- 安全基座：指令签名 ----
+
+func (h *Hub) sign(env *proto.Envelope) {
+	if h.secret == "" {
+		return
+	}
+	env.Sig = crypto.SignCommand(h.secret, env.MsgID, env.Ts, env.Seq, string(env.Payload), env.Nonce)
+}
+
 // ---- helpers ----
+
+func deviceIDFromPath(path string) string {
+	trimmed := strings.TrimPrefix(path, "/api/v1/devices/")
+	parts := strings.Split(trimmed, "/")
+	if len(parts) == 0 {
+		return ""
+	}
+	return parts[0]
+}
 
 func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -498,6 +611,7 @@ func writeJSON(w http.ResponseWriter, v any) {
 
 func writeErr(w http.ResponseWriter, code int, msg string) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(map[string]any{"code": code, "message": msg})
 }
 
@@ -522,3 +636,51 @@ func mustRaw(v any) json.RawMessage {
 	b, _ := json.Marshal(v)
 	return b
 }
+
+func itoa(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	neg := n < 0
+	if neg {
+		n = -n
+	}
+	buf := [12]byte{}
+	pos := len(buf)
+	for n > 0 {
+		pos--
+		buf[pos] = byte('0' + n%10)
+		n /= 10
+	}
+	if neg {
+		pos--
+		buf[pos] = '-'
+	}
+	return string(buf[pos:])
+}
+
+func atoi(s string) (int, error) {
+	n := 0
+	neg := false
+	i := 0
+	if i < len(s) && (s[i] == '-' || s[i] == '+') {
+		neg = s[i] == '-'
+		i++
+	}
+	for ; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return 0, jsonError("not a number")
+		}
+		n = n*10 + int(s[i]-'0')
+	}
+	if neg {
+		n = -n
+	}
+	return n, nil
+}
+
+func jsonError(s string) error { return &simpleErr{s} }
+
+type simpleErr struct{ s string }
+
+func (e *simpleErr) Error() string { return e.s }

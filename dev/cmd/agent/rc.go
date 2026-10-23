@@ -171,11 +171,3 @@ func sendRCEvent(conn *ws.Conn, sessionID, kind, msg string, req, consented bool
 		_ = conn.WriteMessage(b)
 	}
 }
-
-func sendResult(conn *ws.Conn, res proto.ResultPayload) {
-	if env, err := proto.NewEnvelope(proto.TypeResult, nextSeq(), res); err == nil {
-		if b, err := json.Marshal(env); err == nil {
-			_ = conn.WriteMessage(b)
-		}
-	}
-}

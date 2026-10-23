@@ -12,6 +12,7 @@
     header h1 { font-size:18px; margin:0; font-weight:600; }
     nav a { color:#fff; margin-left:16px; text-decoration:none; font-size:13px; opacity:.9; }
     nav a:hover { opacity:1; }
+    header .sub { font-size:12px; opacity:.8; }
     main { padding:20px 24px; max-width:1200px; margin:0 auto; }
     .bar { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-bottom:14px; }
     select, input, button { padding:8px 10px; border:1px solid var(--line); border-radius:10px; font-size:13px; background:#fff; }
@@ -31,8 +32,8 @@
 </head>
 <body>
   <header>
-    <div><h1>御端 · 远程控制</h1></div>
-    <nav><a href="/">资产管理</a><a href="/software.html">软件分发</a></nav>
+    <div><h1>御端 · 远程控制</h1><div class="sub">操作员：<span id="role">-</span></div></div>
+    <nav><a href="/">资产管理</a><a href="/software.html">软件分发</a><a href="/audit.html">审计</a><a href="#" id="logout">退出</a></nav>
   </header>
   <main>
     <div class="bar">
@@ -56,6 +57,7 @@
     </div>
   </main>
 
+  <script src="auth.js"></script>
   <script>
     let ws = null;
     let sessionID = null;
@@ -72,7 +74,7 @@
     }
 
     async function refreshDevices() {
-      const dev = await fetch('/api/v1/devices').then(r => r.json());
+      const dev = await api('/api/v1/devices');
       const sel = document.getElementById('deviceSel');
       sel.innerHTML = '<option value="">选择被控设备…</option>' +
         (dev.devices || []).map(d => `<option value="${d.id}">${d.hostname} (${d.os}/${d.arch}) ${d.online?'在线':'离线'}</option>`).join('');
@@ -111,7 +113,7 @@
       connect();
       sessionID = 's-' + Math.random().toString(36).slice(2, 10);
       const env = { ver:1, msg_id:'m'+Date.now(), ts:Math.floor(Date.now()/1000), type:'rc_request', seq:1,
-        payload:{ device_id:id, session_id:sessionID, operator:'admin' } };
+        payload:{ device_id:id, session_id:sessionID, operator:(window.YD_USER || 'admin') } };
       ws.onopen = () => { ws.send(JSON.stringify(env)); log('已发送远控请求'); };
     };
 

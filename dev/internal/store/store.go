@@ -33,6 +33,7 @@ type Store interface {
 	Get(id string) (Device, bool)
 	List() []Device
 	MarkOffline(id string)
+	Touch(id string)
 	Count() int
 }
 

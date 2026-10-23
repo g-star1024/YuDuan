@@ -12,6 +12,7 @@
     header h1 { font-size:18px; margin:0; font-weight:600; }
     nav a { color:#fff; margin-left:16px; text-decoration:none; font-size:13px; opacity:.9; }
     nav a:hover { opacity:1; }
+    header .sub { font-size:12px; opacity:.8; }
     main { padding:20px 24px; max-width:1100px; margin:0 auto; }
     .card { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:16px; margin-bottom:18px; }
     .card h2 { font-size:15px; margin:0 0 12px; }
@@ -28,8 +29,8 @@
 </head>
 <body>
   <header>
-    <div><h1>御端 · 软件分发</h1></div>
-    <nav><a href="/">资产管理</a><a href="/rc.html">远程控制</a></nav>
+    <div><h1>御端 · 软件分发</h1><div class="sub">操作员：<span id="role">-</span></div></div>
+    <nav><a href="/">资产管理</a><a href="/rc.html">远程控制</a><a href="/audit.html">审计</a><a href="#" id="logout">退出</a></nav>
   </header>
   <main>
     <div class="card">
@@ -55,6 +56,7 @@
     </div>
   </main>
 
+  <script src="auth.js"></script>
   <script>
     const out = document.getElementById('out');
     function show(v){ out.textContent = (typeof v === 'string') ? v : JSON.stringify(v, null, 2); }
@@ -68,14 +70,14 @@
       if (!f) { alert('请选择文件'); return; }
       fd.append('file', f);
       show('上传中…');
-      const r = await fetch('/api/v1/software', { method:'POST', body: fd }).then(r => r.json());
+      const r = await api('/api/v1/software', { method:'POST', body: fd });
       show(r);
       refreshRepo();
     };
 
     async function refreshRepo() {
-      const data = await fetch('/api/v1/software').then(r => r.json());
-      const dev = await fetch('/api/v1/devices').then(r => r.json());
+      const data = await api('/api/v1/software');
+      const dev = await api('/api/v1/devices');
       const devOpts = (dev.devices||[]).map(d => `<option value="${d.id}">${d.hostname} (${d.os})</option>`).join('');
       const rows = (data.items||[]).map(it => `
         <tr>
@@ -94,10 +96,10 @@
       const id = document.getElementById('dev-'+swid).value;
       if (!id) { alert('请选择目标设备'); return; }
       show('分发中…');
-      const r = await fetch(`/api/v1/devices/${id}/push`, {
+      const r = await api(`/api/v1/devices/${id}/push`, {
         method:'POST', headers:{'Content-Type':'application/json'},
         body: JSON.stringify({ software_id: swid })
-      }).then(r => r.json());
+      });
       show(r);
     };
 

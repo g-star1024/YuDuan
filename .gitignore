@@ -14,3 +14,10 @@ dev/bin/
 
 # 运行时数据（软件仓库落盘、Agent 临时下载/解包，非源码）
 dev/data/
+
+# TLS 自签证书（本地/测试生成，含私钥，禁止入库）
+dev/certs/
+*.pem
+
+# Rust 副端编译产物（rustc 离线构建输出）
+rust/agent/target/

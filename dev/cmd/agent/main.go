@@ -1,5 +1,5 @@
-// 御端副端参考 Agent 入口（M2 底座联调）。
-// 说明：本文件为 Go 参考实现，用于打通协议；生产副端将按铁律以 Rust 重写（逻辑等价）。
+// 御端副端参考 Agent 入口（M2 底座 + M4 远控 + M5 分发 + M6 安全基座）。
+// 说明：本文件为 Go 参考实现，用于打通协议；生产副端将以 Rust 重写（逻辑等价）。
 package main
 
 import (
@@ -9,10 +9,12 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"yuduan/internal/collect"
+	"yuduan/internal/crypto"
 	"yuduan/internal/proto"
 	"yuduan/internal/ws"
 )
@@ -20,21 +22,25 @@ import (
 const agentVersion = "0.1.0"
 
 var seq int64
+var hmacSecret string
+var hmacEnforce bool
+var seenNonces sync.Map // 防重放：已见 nonce
 
 func nextSeq() int64 { return atomic.AddInt64(&seq, 1) }
 
 func main() {
 	hubURL := envOr("YUDUAN_HUB", "ws://127.0.0.1:8080/ws/agent")
-	token := os.Getenv("YUDUAN_TOKEN")
+	hmacSecret = os.Getenv("YUDUAN_HMAC_SECRET")
+	hmacEnforce = os.Getenv("YUDUAN_HMAC_ENFORCE") == "1"
 	for {
-		if err := run(hubURL, token); err != nil {
+		if err := run(hubURL); err != nil {
 			log.Printf("[agent] 连接错误: %v; 5s 后重连", err)
 			time.Sleep(5 * time.Second)
 		}
 	}
 }
 
-func run(hubURL, token string) error {
+func run(hubURL string) error {
 	conn, err := ws.Dial(hubURL)
 	if err != nil {
 		return err
@@ -43,18 +49,9 @@ func run(hubURL, token string) error {
 
 	a := collect.Gather(agentVersion)
 	reg := proto.RegisterPayload{
-		Hostname:     a.Hostname,
-		OS:           a.OS,
-		OSVersion:    a.OSVersion,
-		Arch:         a.Arch,
-		CPU:          a.CPU,
-		MemoryGB:     a.MemoryGB,
-		DiskGB:       a.DiskGB,
-		SerialNo:     a.SerialNo,
-		MAC:          a.MAC,
-		IP:           a.IP,
-		AgentVersion: a.AgentVersion,
-		Token:        token,
+		Hostname: a.Hostname, OS: a.OS, OSVersion: a.OSVersion, Arch: a.Arch,
+		CPU: a.CPU, MemoryGB: a.MemoryGB, DiskGB: a.DiskGB, SerialNo: a.SerialNo,
+		MAC: a.MAC, IP: a.IP, AgentVersion: a.AgentVersion, Token: os.Getenv("YUDUAN_TOKEN"),
 	}
 	if env, err := proto.NewEnvelope(proto.TypeRegister, nextSeq(), reg); err == nil {
 		if b, err := json.Marshal(env); err == nil {
@@ -74,10 +71,9 @@ func run(hubURL, token string) error {
 	if err := ackEnv.DecodePayload(&ack); err != nil || !ack.OK {
 		return fmt.Errorf("register rejected")
 	}
-	token = ack.Token
+	os.Setenv("YUDUAN_TOKEN", ack.Token)
 	log.Printf("[agent] 注册成功 device_id=%s host=%s os=%s arch=%s", ack.DeviceID, a.Hostname, a.OS, a.Arch)
 
-	// 心跳
 	go func() {
 		ticker := time.NewTicker(30 * time.Second)
 		for range ticker.C {
@@ -88,7 +84,6 @@ func run(hubURL, token string) error {
 		}
 	}()
 
-	// 指令循环
 	for {
 		raw, err := conn.ReadMessage()
 		if err != nil {
@@ -98,9 +93,15 @@ func run(hubURL, token string) error {
 		if err := json.Unmarshal(raw, &env); err != nil {
 			continue
 		}
-		if env.Type == proto.TypeCommand {
+		switch env.Type {
+		case proto.TypeCommand:
 			var c proto.CommandPayload
 			if err := env.DecodePayload(&c); err != nil {
+				continue
+			}
+			// 安全基座：HMAC 验签（默认不强制，便于兼容未签名的演示链路）
+			if !verifyCmd(&env) {
+				sendResult(conn, proto.ResultPayload{TaskID: c.TaskID, State: "failed", ExitCode: -1, OutputLog: "HMAC 验签失败或重放被拒"})
 				continue
 			}
 			if c.Action == "sw_install" {
@@ -108,10 +109,6 @@ func run(hubURL, token string) error {
 			} else {
 				go handleCommand(conn, c)
 			}
-		}
-
-		// —— M4 远程控制 ——
-		switch env.Type {
 		case proto.TypeRCRequest:
 			var p proto.RCRequestPayload
 			if err := env.DecodePayload(&p); err != nil {
@@ -127,8 +124,33 @@ func run(hubURL, token string) error {
 			applyInput(conn, p.SessionID, p)
 		case proto.TypeRCStop:
 			stopRC()
+		default:
+			// 未知消息类型优雅忽略（如 Rust 副端不识别的远控消息）
 		}
 	}
+}
+
+// verifyCmd 校验指令 HMAC 签名与重放；未启用签名时直接放行。
+func verifyCmd(env *proto.Envelope) bool {
+	if hmacSecret == "" {
+		return true
+	}
+	valid := crypto.VerifyCommand(hmacSecret, env.Sig, env.MsgID, env.Ts, env.Seq, string(env.Payload), env.Nonce, 300)
+	if valid {
+		if hmacEnforce {
+			if _, seen := seenNonces.LoadOrStore(env.Nonce, true); seen {
+				log.Printf("[agent] 拒绝重放指令 nonce=%s", env.Nonce)
+				return false
+			}
+		}
+		return true
+	}
+	if hmacEnforce {
+		log.Printf("[agent] 拒绝签名无效指令 msg_id=%s", env.MsgID)
+		return false
+	}
+	log.Printf("[agent] 警告：指令签名无效但未强制拒绝（enforce=off）msg_id=%s", env.MsgID)
+	return true
 }
 
 func handleCommand(conn *ws.Conn, c proto.CommandPayload) {
@@ -150,6 +172,10 @@ func handleCommand(conn *ws.Conn, c proto.CommandPayload) {
 		res.State = "failed"
 		res.OutputLog = "unknown action: " + c.Action
 	}
+	sendResult(conn, res)
+}
+
+func sendResult(conn *ws.Conn, res proto.ResultPayload) {
 	if env, err := proto.NewEnvelope(proto.TypeResult, nextSeq(), res); err == nil {
 		if b, err := json.Marshal(env); err == nil {
 			_ = conn.WriteMessage(b)
