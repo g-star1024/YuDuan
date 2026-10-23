@@ -117,7 +117,7 @@
 > M4 MVP（§8.1）采用「中枢居中中继 + JPEG base64 文本帧」。本节能演进为 §4 规划的生产目标：  
 > **二进制帧 + 编解码器协商 + P2P 直连媒体通道（中继兜底）+ 原生编码器（H.264/H.265/VP8/VP9/AV1）**。  
 > 既有 JSON 中继路径保留为 P2P 不可达时的兜底，二者并存、不互斥。  
-> **2026-10-23：运行时闭环已接入**（见 8.3.5），端到端验证通过（P2P 直连 / 中继 / 回退三场景）。
+> **2026-10-23：运行时闭环已接入**（见 8.3.5），端到端验证通过（P2P 直连 / 中继 / 回退 / RAW_RGBA / 原生编码器桩 / 诚实回退 / ICE 候选升级，共 7+ 场景）。
 
 #### 8.3.1 二进制帧（固定头 + payload）
 
@@ -164,15 +164,28 @@
 任一端 rc_stop ──► 会话结束（清通道、drop 直连）
 ```
 
-- **编解码器 clamp（诚实回退，不造假帧）**：当前采集链（macOS `screencapture` / Linux `scrot|import`）只产出 JPEG；主端选择 `RAW_RGBA` 或原生编解码器时，被控端回退 JPEG 并以 `rc_event(kind=media_selected)` 明确告知实际通道。原生编码器的输入是 RGBA，待 RGBA 采集源（§8.3.6）接入后即插即用。
-- **通道选择**：`transport=p2p` 且 `media_addr` 可达 → P2p 直连（`dial_direct` 3s 超时）；不可达或 `relay` → 经中枢长连接的二进制 WS 帧中继（`ws` 包 opcode `0x2`，hub 双向透传）。直连失败自动回退中继，会话不中断。
-- **主端差异**：浏览器（`console/rc.html`）无法监听裸 TCP，固定 `transport=relay`，按 `ArrayBuffer` 收帧并解码渲染（jpeg→canvas、raw_rgba→`putImageData`、原生码流→帧统计展示，由原生主端解码）；P2P 直连服务原生主端（Tauri）。
+- **编解码器协商与 clamp（诚实回退，不造假帧）**：协商期被控端做能力探测——`rgba_capture_ok()`（一次真实 RGBA 采集）与 `NativeEncoder::try_load()`（动态库能否创建该编解码器句柄）；`rc_capabilities` 仅宣告真实可产出的编解码器（配置 `YUDUAN_ENCODER_LIB` 时逐个探测，不虚标）。主端选择不可产出的编解码器时回退 JPEG，并以 `rc_event(kind=notice)` 明确告知。能力宣告载荷为扁平字段（与 Go `proto.RCCapabilitiesPayload` 一致）。
+- **采集源随协商 codec 切换**：JPEG 走采集工具链（macOS `screencapture` / Linux `scrot|import`）；`RAW_RGBA`/原生走 RGBA 采集源（§8.3.6：macOS CoreGraphics / Linux X11 XGetImage / Windows GDI，统一输出紧凑 RGBA8，BGRA→RGBA 交换）。RAW 数据不会冒充当 JPEG：通道损坏时清通道，下一轮回采 JPEG 走 JSON 兜底。
+- **通道选择**：`transport=p2p` 且 `media_addr` 可达 → P2p 直连（`dial_direct` 3s 超时）；首跳失败不放弃——保持 `RC_WANT_P2P`，等待 `rc_offer`/`rc_candidate` 候选到达后逐个 dial（ICE-lite），全部失败才回退经中枢长连接的二进制 WS 帧中继（`ws` 包 opcode `0x2`，hub 双向透传）。会话不中断。
+- **主端差异**：浏览器（`console/rc.html`）无法监听裸 TCP，固定 `transport=relay`，按 `ArrayBuffer` 收帧并解码渲染（jpeg→canvas、raw_rgba→`putImageData`、原生码流→WebCodecs `VideoDecoder`：Annex-B 拆 NAL、SPS/PPS 组 avcC description、AVCC 长度前缀送帧，失败自动回退帧统计）；P2P 直连服务原生主端（Tauri）。
 - **兜底**：未协商二进制通道（rc_select 未达/前）或通道损坏（编码/发送失败）时，帧循环回退 JSON `rc_frame`（M4 MVP 兼容），损坏时清通道并发 `rc_event(notice)`。
 - **会话代次守卫**：`RC_GEN` 代次计数防止上一次会话的帧循环残留（连续会话场景）。
-- **参考实现与验证**：`dev/cmd/p2pviewer`（e2e viewer：建会话→协商→按 transport 收帧→校验 magic/SOI→落盘）；三场景实测：P2P 直连 5 帧、中继 5 帧、P2P 不可达回退中继 5 帧，落盘均为真实 JPEG（3584×2240）。
+- **参考实现与验证**：`dev/cmd/p2pviewer`（e2e viewer：建会话→等能力→rc_select→广播 ICE 候选→按 transport 收帧→校验 magic/SOI/RAW 尺寸→落盘→统计；`media_selected` 事件可获悉被控端实际 codec）。
 
-#### 8.3.6 剩余缺口（规划项）
+#### 8.3.6 RGBA 采集源 / ICE-lite / 原生编码器验证（2026-10-23 补齐）
 
-- **RGBA 采集源**：macOS CoreGraphics（`CGDisplayCreateImage`→像素）/ Linux XShm·XGetImage / Windows GDI，接入后原生编码器（C-ABI）与 `RAW_RGBA` 通道即可产出真实码流。
-- **ICE-lite 候选交换**：`rc_offer`/`rc_answer`/`rc_candidate` 信令已定义且中枢双向中继，被控端尚未消费；当前 P2P 为 `rc_select.media_addr` 单地址直连，候选交换用于 NAT/多网卡场景择优。
-- **原生码流解码渲染**：浏览器参考台不内置 H.264/H.265 解码；主端（Tauri）需接 WebCodecs 或原生解码器完成渲染。
+- **RGBA 采集源（已接入，macOS 实测）**：
+  - macOS：CoreGraphics `CGDisplayCreateImage` → `CGDataProviderCopyData`（CFData），32bpp BGRA8888 逐像素交换 B/R 得紧凑 RGBA8；
+  - Linux：X11 `XGetImage`（ZPixmap，TrueColor 32bpp BGRX/BGRA 或 24bpp 紧凑，交换 B/R）；
+  - Windows：GDI `BitBlt` + `GetDIBits`（BI_RGB 32bpp，负高度自顶向下，交换 B/R）。
+  - 实测（macOS 3584×2240）：RAW_RGBA 帧载荷 32,112,640 B = 宽×高×4，端到端 3 帧全过。无权限/无显示/布局不符返回 None，协商期探测后诚实回退 JPEG。
+- **ICE-lite 候选交换（已接入并实测）**：主端（p2pviewer）按监听绑定方式生成候选——具体 IP 绑定 → 唯一候选；通配绑定（0.0.0.0/::）→ 枚举非回送网卡 IPv4 + 监听端口；`rc_offer`（批量）+ `rc_candidate`（增量）经中枢中继。被控端 `try_candidate`：仅 `RC_WANT_P2P` 且尚无 P2P 通道时逐个 dial，成功即替换通道（保留协商 codec）并发 `media_selected`。实测两型：具体绑定候选 `127.0.0.1:port` 升级成功；通配绑定候选 `192.168.0.109:port`（LAN IP）升级成功。
+- **原生编码器 C-ABI（已端到端验证）**：`clang -dynamiclib` 编译验证桩（仅接受 h264，输出 `"STUB"`+RGBA），`YUDUAN_ENCODER_LIB` 指向后：能力探测宣告 `codecs=[raw_rgba,jpeg,h264]`（h265/vp8/vp9/av1 被桩拒绝故不宣告）；协商 h264 → RGBA 采集 → 桩编码 → 二进制帧，对端校验载荷首 4 字节为 `STUB`、总长 = 宽×高×4+4，3 帧全过。真实 H.264/H.265 编码器动态库按同一 ABI 供给即可上线。
+- **原生码流解码渲染（浏览器参考台已接 WebCodecs）**：`rc.html` 对 h264/h265/vp8/vp9/av1 帧走 `VideoDecoder`（Annex-B 拆 NAL → avcC description（SPS/PPS）→ 4 字节长度前缀送 `EncodedVideoChunk` → `VideoFrame` 绘 canvas）；`VideoDecoder` 不可用/configure/decode 失败自动回退帧统计。NAL 拆分/avcC 组包/AVCC 转换经合成 Annex-B 流（SPS+PPS+IDR）逐字节验证。
+
+#### 8.3.7 仍缺（生产化最后段）
+
+- **真实原生编码器动态库**：H.264/H.265 等（可用 VideoToolbox/VAAPI/MF 或 x264/x265 封装 C-ABI）；当前仅桩库验证 ABI 契约。
+- **Linux/Windows 实跑**：采集（X11/GDI）与输入注入（XTest/SendInput）分支已写，需对应机器实测；本机（macOS）已全量验证。
+- **媒体环性能**：帧循环当前 500ms/帧（2fps）、5K 屏 RAW 32MB/帧；生产需协商降采样（capabilities.max_w/h 生效）、可变帧率与带宽自适应。
+- **录像留存**：§5 加密录像留存策略待产品决策后实现。

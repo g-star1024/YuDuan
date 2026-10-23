@@ -132,6 +132,7 @@
       if (version !== 1) { log(`不支持的帧版本 ${version}`); return; }
       const stream = dv.getUint8(5);
       const codec = dv.getUint8(6);
+      const flags = dv.getUint8(7);
       const seq = dv.getUint32(8, true);
       const w = dv.getUint16(12, true);
       const h = dv.getUint16(14, true);
@@ -152,10 +153,138 @@
         // RAW_RGBA：直接 putImageData
         if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
         ctx.putImageData(new ImageData(new Uint8ClampedArray(buf, FRAME_HEADER_LEN, len), w, h), 0, 0);
+      } else if (codec >= 2 && codec <= 6) {
+        // 原生码流（h264/h265/vp8/vp9/av1）：优先 WebCodecs 解码渲染；
+        // 不可用/失败（如验证桩码流）自动回退帧统计展示。
+        if (!decodeNativeFrame(codec, new Uint8Array(buf, FRAME_HEADER_LEN, len), seq, flags, w, h)) {
+          statusEl.textContent = `${CODEC_NAMES[codec] || codec} 帧 #${seq}（WebCodecs 不可用/解码失败，仅统计）`;
+        }
       } else {
-        // 原生编码（h264/h265/vp8/vp9/av1）：浏览器参考台不解码，展示帧信息（主端 Tauri 渲染）
-        statusEl.textContent = `${CODEC_NAMES[codec] || codec} 帧 #${seq}（浏览器参考台不解码，主端渲染）`;
+        statusEl.textContent = `未知编解码器 ${codec} 帧 #${seq}`;
       }
+    }
+
+    // —— 原生码流 WebCodecs 解码（浏览器参考台；主端 Tauri 用原生解码器）——
+    let vDecoder = null, vDecoderCodec = 0, vDecoderFailed = false;
+
+    function webCodecsMime(codec) {
+      switch (codec) {
+        case 2: return 'avc1.42E01E';        // H.264 baseline 3.1（保守兼容）
+        case 3: return 'hvc1.1.6.L93.B0';    // H.265 main
+        case 4: return 'vp08.00.10.08';      // VP8
+        case 5: return 'vp09.00.10.08';      // VP9 profile 0
+        case 6: return 'av01.0.04M.08';      // AV1 main 0 level 4
+        default: return null;
+      }
+    }
+
+    // Annex-B 流拆分 NAL（起始码 00 00 01 / 00 00 00 01）；返回 [{type, data}]。
+    function splitAnnexB(u8) {
+      const nals = [];
+      let i = 0, start = -1;
+      while (i + 2 < u8.length) {
+        if (u8[i] === 0 && u8[i + 1] === 0 && u8[i + 2] === 1) {
+          if (start >= 0) nals.push({ type: u8[start] & 0x1f, data: u8.subarray(start, i) });
+          i += 3; start = i;
+        } else if (i + 3 < u8.length && u8[i] === 0 && u8[i + 1] === 0 && u8[i + 2] === 0 && u8[i + 3] === 1) {
+          if (start >= 0) nals.push({ type: u8[start] & 0x1f, data: u8.subarray(start, i) });
+          i += 4; start = i;
+        } else { i++; }
+      }
+      if (start >= 0 && start < u8.length) nals.push({ type: u8[start] & 0x1f, data: u8.subarray(start) });
+      return nals;
+    }
+
+    // H.264：从 Annex-B 提取 SPS(7)/PPS(8) 组 avcC description（无则 null）。
+    function h264Description(u8) {
+      const sps = splitAnnexB(u8).find(n => n.type === 7);
+      const pps = splitAnnexB(u8).find(n => n.type === 8);
+      if (!sps || !pps || sps.data.length < 4) return null;
+      const s = sps.data, p = pps.data;
+      const d = new Uint8Array(11 + s.length + p.length);
+      let o = 0;
+      d[o++] = 1;                      // configurationVersion
+      d[o++] = s[1]; d[o++] = s[2]; d[o++] = s[3]; // profile/compat/level
+      d[o++] = 0xFF;                   // lengthSizeMinusOne=3（4 字节长度前缀）
+      d[o++] = 0xE1;                   // numOfSPS=1
+      d[o++] = (s.length >> 8) & 0xFF; d[o++] = s.length & 0xFF;
+      d.set(s, o); o += s.length;
+      d[o++] = 1;                      // numOfPPS=1
+      d[o++] = (p.length >> 8) & 0xFF; d[o++] = p.length & 0xFF;
+      d.set(p, o);
+      return d;
+    }
+
+    // Annex-B → 4 字节大端长度前缀NAL（EncodedVideoChunk 需要 avcC 风格，无起始码）。
+    function annexBToAvcc(u8) {
+      const nals = splitAnnexB(u8);
+      if (!nals.length) return null;
+      let total = 0;
+      for (const n of nals) total += 4 + n.data.length;
+      const out = new Uint8Array(total);
+      let o = 0;
+      for (const n of nals) {
+        out[o++] = (n.data.length >> 24) & 0xFF; out[o++] = (n.data.length >> 16) & 0xFF;
+        out[o++] = (n.data.length >> 8) & 0xFF; out[o++] = n.data.length & 0xFF;
+        out.set(n.data, o); o += n.data.length;
+      }
+      return out;
+    }
+
+    function ensureDecoder(codec, u8) {
+      if (vDecoder && vDecoderCodec === codec && vDecoder.state === 'configured') return vDecoder;
+      if (vDecoder) { try { vDecoder.close(); } catch (e) {} vDecoder = null; }
+      if (!('VideoDecoder' in window)) { vDecoderFailed = true; return null; }
+      try {
+        const cfg = { codec: webCodecsMime(codec), optimizeForLatency: true };
+        if (codec === 2) { const desc = h264Description(u8); if (desc) cfg.description = desc; }
+        const d = new VideoDecoder({
+          output: (frame) => {
+            try {
+              if (canvas.width !== frame.displayWidth || canvas.height !== frame.displayHeight) {
+                canvas.width = frame.displayWidth; canvas.height = frame.displayHeight;
+              }
+              ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
+            } finally { frame.close(); }
+          },
+          error: (e) => { vDecoderFailed = true; log(`WebCodecs 解码失败，回退统计: ${e.message || e}`); },
+        });
+        d.configure(cfg);
+        vDecoder = d; vDecoderCodec = codec;
+        return d;
+      } catch (e) {
+        vDecoderFailed = true;
+        log(`WebCodecs 初始化失败，回退统计: ${e.message || e}`);
+        return null;
+      }
+    }
+
+    // 解码一帧原生码流；返回 false = 应回退统计展示（不可用/失败）。
+    function decodeNativeFrame(codec, u8, seq, flags, w, h) {
+      if (vDecoderFailed) return false;
+      const d = ensureDecoder(codec, u8);
+      if (!d || d.state !== 'configured') return false;
+      const data = annexBToAvcc(u8);
+      if (!data) return false;
+      // 关键帧判定：H.264 找 IDR(5)/SPS(7)/PPS(8)；其余用帧头 keyframe 标志。
+      const nals = splitAnnexB(u8);
+      const isKey = codec === 2
+        ? nals.some(n => n.type === 5 || n.type === 7 || n.type === 8)
+        : (flags & 1) !== 0;
+      try {
+        d.decode(new EncodedVideoChunk({ type: isKey ? 'key' : 'delta', timestamp: seq * 1000, data }));
+        return true;
+      } catch (e) {
+        vDecoderFailed = true;
+        log(`WebCodecs 送帧失败，回退统计: ${e.message || e}`);
+        return false;
+      }
+    }
+
+    // 会话结束/重新协商时重置 WebCodecs 解码器（新会话重新 configure）。
+    function resetWebCodecs() {
+      if (vDecoder) { try { vDecoder.close(); } catch (e) {} vDecoder = null; }
+      vDecoderCodec = 0; vDecoderFailed = false;
     }
 
     async function refreshDevices() {
@@ -197,6 +326,7 @@
           log(`被控端就绪 ok=${env.payload.ok}`);
         } else if (env.type === 'rc_stop') {
           log('会话已结束');
+          resetWebCodecs();
           document.getElementById('renegoBtn').disabled = true;
         }
       };
@@ -220,10 +350,11 @@
       }
       if (ws) ws.close();
       sessionID = null;
+      resetWebCodecs();
       document.getElementById('renegoBtn').disabled = true;
     };
 
-    document.getElementById('renegoBtn').onclick = () => sendSelect();
+    document.getElementById('renegoBtn').onclick = () => { resetWebCodecs(); sendSelect(); };
 
     function sendInput(kind, extra) {
       if (!ws || !sessionID) return;

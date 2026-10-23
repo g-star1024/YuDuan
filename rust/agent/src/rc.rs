@@ -214,6 +214,8 @@ mod win32 {
         pub fn SendInput(n: c_uint, inputs: *const INPUT, size: c_int) -> c_uint;
         pub fn VkKeyScanW(ch: u16) -> i16;
         pub fn GetSystemMetrics(index: c_int) -> c_int;
+        pub fn GetDC(hwnd: *mut std::os::raw::c_void) -> *mut std::os::raw::c_void;
+        pub fn ReleaseDC(hwnd: *mut std::os::raw::c_void, hdc: *mut std::os::raw::c_void) -> c_int;
     }
 }
 
@@ -246,6 +248,11 @@ static RC_STOP: AtomicBool = AtomicBool::new(false);
 /// 会话代次：每次 start_rc/stop_rc 递增；帧循环仅当代次仍为 captured 值时继续，
 /// 防止上一次会话的帧线程在新会话开始后残留（连续会话场景）。
 static RC_GEN: AtomicU64 = AtomicU64::new(0);
+/// 当前会话 ID（ICE-lite 候选消费时回事件用）；stop 后清空。
+static RC_SESSION: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+/// 主端选择了 p2p 传输：即使首跳 dial 失败也保持等待，候选地址（rc_offer/rc_candidate）
+/// 到达后逐个尝试，全部失败才维持中枢中继（ICE-lite 单侧监听模型：viewer 监听、agent 拨号）。
+static RC_WANT_P2P: AtomicBool = AtomicBool::new(false);
 
 // ===================== P2P / 二进制帧媒体环（§8.3 运行时接入） =====================
 
@@ -268,23 +275,57 @@ enum MediaChannel {
 /// 当前会话的媒体通道；None = 未协商二进制通道，帧循环走 JSON rc_frame 兜底（M4 MVP 兼容）。
 static RC_MEDIA: std::sync::Mutex<Option<MediaChannel>> = std::sync::Mutex::new(None);
 
-/// 运行时可协商编解码器：当前采集链（screencapture/scrot/import）只产出 JPEG；
-/// 原生编码器（H.264/H.265/…）需要 RGBA 采集源（§8.3 规划项：CoreGraphics/XShm/GDI）。
-/// 对无法产出的选择诚实回退 JPEG 并告知主端——不造假帧。
-fn clamp_runtime_codec(want: u8) -> u8 {
-    if want == crate::rc_media::CODEC_JPEG {
-        return crate::rc_media::CODEC_JPEG;
+impl MediaChannel {
+    fn codec(&self) -> u8 {
+        match self {
+            MediaChannel::P2p { codec, .. } | MediaChannel::Relay { codec, .. } => *codec,
+        }
     }
-    eprintln!(
-        "[agent] 编解码器 {} 需 RGBA 采集源/原生编码链（规划中），本次回退 jpeg",
-        crate::rc_media::codec_name(want)
-    );
-    crate::rc_media::CODEC_JPEG
+}
+
+/// 当前媒体通道是否要求 RAW/原生码流（即帧循环须采集 RGBA 而非 JPEG）。
+fn media_wants_raw() -> bool {
+    match RC_MEDIA.lock().unwrap().as_ref() {
+        Some(ch) => ch.codec() != crate::rc_media::CODEC_JPEG,
+        None => false,
+    }
+}
+
+/// 当前是否已建立 P2P 直连通道。
+fn has_p2p() -> bool {
+    matches!(RC_MEDIA.lock().unwrap().as_ref(), Some(MediaChannel::P2p { .. }))
+}
+
+/// 协商编解码器：把主端选择收敛到运行时可产出集（诚实回退，不造假帧）。
+/// - rgba_ok：RGBA 采集源可用（capture_rgba 探测）；
+/// - native_ok：原生编码器库可加载该编解码器（NativeEncoder::try_load 探测）。
+fn clamp_runtime_codec(want: u8, rgba_ok: bool, native_ok: bool) -> u8 {
+    match want {
+        crate::rc_media::CODEC_JPEG => crate::rc_media::CODEC_JPEG,
+        crate::rc_media::CODEC_RAW_RGBA if rgba_ok => crate::rc_media::CODEC_RAW_RGBA,
+        c if crate::rc_media::is_native_codec(c) && rgba_ok && native_ok => c,
+        _ => {
+            eprintln!(
+                "[agent] 编解码器 {} 运行时不可产出（rgba_ok={} native_ok={}），回退 jpeg",
+                crate::rc_media::codec_name(want),
+                rgba_ok,
+                native_ok
+            );
+            crate::rc_media::CODEC_JPEG
+        }
+    }
+}
+
+/// 原生编码器可用性探测：库已配置且能创建该编解码器句柄。
+fn native_encoder_ok(codec: u8) -> bool {
+    crate::rc_media::is_native_codec(codec) && crate::rc_media::NativeEncoder::try_load(codec).is_some()
 }
 
 /// 处理 rc_select（主端协商结果，§8.3）：
-/// 1) 按主端选择协商编解码器（clamp 到运行时可产出集）；2) transport=p2p 时 dial_direct
-/// 主端媒体地址，失败回退 Relay；3) 落通道并以 rc_event(media_selected) 告知主端实际通道。
+/// 1) 按主端选择协商编解码器（clamp 到运行时可产出集，回退时明确告知）；
+/// 2) transport=p2p 时 dial_direct 主端媒体地址，失败不放弃——保持 RC_WANT_P2P，
+///    等待 rc_offer/rc_candidate 候选到达后逐个尝试（ICE-lite）；
+/// 3) 落通道并以 rc_event(media_selected) 告知主端实际通道。
 pub fn handle_rc_select(
     writer: &Writer,
     rng: &Arc<Mutex<crate::Lcg>>,
@@ -298,7 +339,29 @@ pub fn handle_rc_select(
         .unwrap_or(crate::rc_media::CODEC_JPEG as i64) as u8;
     let transport = p.get("transport").and_then(|v| v.as_str()).unwrap_or("relay");
     let media_addr = p.get("media_addr").and_then(|v| v.as_str()).unwrap_or("");
-    let codec = clamp_runtime_codec(want_codec);
+
+    // 能力探测（各一次）：RGBA 采集源 + 原生编码器库
+    let rgba_ok = rgba_capture_ok();
+    let native_ok = native_encoder_ok(want_codec);
+    let codec = clamp_runtime_codec(want_codec, rgba_ok, native_ok);
+    if codec != want_codec {
+        send_rc_event(
+            writer,
+            rng,
+            seq,
+            session_id,
+            "notice",
+            &format!(
+                "编解码器 {} 本机不可产出，已回退 {}",
+                crate::rc_media::codec_name(want_codec),
+                crate::rc_media::codec_name(codec)
+            ),
+            false,
+            false,
+        );
+    }
+
+    RC_WANT_P2P.store(transport == "p2p" && !media_addr.is_empty(), Ordering::SeqCst);
 
     let mut channel: Option<MediaChannel> = None;
     if transport == "p2p" && !media_addr.is_empty() {
@@ -312,7 +375,7 @@ pub fn handle_rc_select(
                 channel = Some(MediaChannel::P2p { stream, codec, encoder: make_encoder(codec) });
             }
             Err(e) => {
-                eprintln!("[agent] P2P 直连失败({})，回退中枢二进制中继", e);
+                eprintln!("[agent] P2P 首跳直连失败({})，等待 ICE-lite 候选/回退中枢中继", e);
             }
         }
     }
@@ -333,6 +396,93 @@ pub fn handle_rc_select(
         false,
         false,
     );
+}
+
+/// 尝试用候选地址升级/建立 P2P 直连（ICE-lite：viewer 监听、agent 拨号）。
+/// 成功则替换当前媒体通道（保留协商 codec）；失败仅记录，维持现有通道（中继兜底）。
+fn try_candidate(
+    writer: &Writer,
+    rng: &Arc<Mutex<crate::Lcg>>,
+    seq: &Arc<Mutex<u64>>,
+    session_id: &str,
+    candidate: &str,
+) -> bool {
+    if !RC_WANT_P2P.load(Ordering::SeqCst) || has_p2p() {
+        return false;
+    }
+    match crate::rc_media::dial_direct(candidate) {
+        Ok(stream) => {
+            let codec = current_codec();
+            eprintln!(
+                "[agent] P2P 候选直连成功 {} codec={}",
+                candidate,
+                crate::rc_media::codec_name(codec)
+            );
+            *RC_MEDIA.lock().unwrap() =
+                Some(MediaChannel::P2p { stream, codec, encoder: make_encoder(codec) });
+            send_rc_event(
+                writer,
+                rng,
+                seq,
+                session_id,
+                "media_selected",
+                &format!("媒体通道就绪：p2p 候选直连 {} + {}", candidate, crate::rc_media::codec_name(codec)),
+                false,
+                false,
+            );
+            true
+        }
+        Err(e) => {
+            eprintln!("[agent] P2P 候选 {} 拨号失败({})", candidate, e);
+            false
+        }
+    }
+}
+
+/// 当前通道 codec（无通道时默认 JPEG）。
+fn current_codec() -> u8 {
+    match RC_MEDIA.lock().unwrap().as_ref() {
+        Some(ch) => ch.codec(),
+        None => crate::rc_media::CODEC_JPEG,
+    }
+}
+
+/// 处理 rc_offer：主端批量上报候选地址（§8.3 ICE-lite），逐个尝试直连。
+pub fn handle_rc_offer(
+    writer: &Writer,
+    rng: &Arc<Mutex<crate::Lcg>>,
+    seq: &Arc<Mutex<u64>>,
+    p: &crate::Json,
+) {
+    let session = RC_SESSION.lock().unwrap().clone().unwrap_or_default();
+    let cands: Vec<String> = match p.get("candidates") {
+        Some(crate::Json::Arr(a)) => a
+            .iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .collect(),
+        _ => Vec::new(),
+    };
+    if cands.is_empty() {
+        return;
+    }
+    for c in cands {
+        if try_candidate(writer, rng, seq, &session, &c) {
+            break;
+        }
+    }
+}
+
+/// 处理 rc_candidate：主端增量上报单个候选地址（§8.3 ICE-lite）。
+pub fn handle_rc_candidate(
+    writer: &Writer,
+    rng: &Arc<Mutex<crate::Lcg>>,
+    seq: &Arc<Mutex<u64>>,
+    p: &crate::Json,
+) {
+    let session = RC_SESSION.lock().unwrap().clone().unwrap_or_default();
+    if let Some(c) = p.get("candidate").and_then(|v| v.as_str()) {
+        try_candidate(writer, rng, seq, &session, c);
+    }
 }
 
 /// 二进制媒体帧发送结果。
@@ -404,7 +554,9 @@ fn send_media_frame(writer: &Writer, data: &[u8], w: usize, h: usize, seq: i64, 
 pub fn start_rc(writer: Writer, rng: Arc<Mutex<crate::Lcg>>, seq: Arc<Mutex<u64>>, session_id: String, _device_id: String) {
     RC_STOP.store(false, Ordering::SeqCst);
     let gen = RC_GEN.fetch_add(1, Ordering::SeqCst) + 1; // 新会话代次（旧帧线程随之失效）
+    RC_WANT_P2P.store(false, Ordering::SeqCst);
     *RC_MEDIA.lock().unwrap() = None; // 新会话重新协商媒体通道
+    *RC_SESSION.lock().unwrap() = Some(session_id.clone());
 
     // 合规：本地通知 + 事件（员工知情可拒绝；开发态自动授权见 rc_event）
     show_remote_notice();
@@ -427,37 +579,50 @@ pub fn start_rc(writer: Writer, rng: Arc<Mutex<crate::Lcg>>, seq: Arc<Mutex<u64>
                 break;
             }
             frame_seq += 1;
-            match capture_jpeg() {
-                Some((data, w, h)) => {
-                    // 二进制媒体环（§8.3）：已协商通道 → 按协商 codec 编码采集帧 → 二进制帧。
-                    match send_media_frame(&writer, &data, w, h, frame_seq, started.elapsed().as_millis() as u32) {
-                        SendOutcome::Sent => continue,
-                        SendOutcome::Broken => {
-                            // 通道损坏：清空回退 JSON 中继（会话不中断）
-                            *RC_MEDIA.lock().unwrap() = None;
-                            send_rc_event(&writer, &rng, &seq, &session_id, "notice",
-                                "媒体通道中断，已回退 JSON 中继", false, false);
-                        }
-                        SendOutcome::NoChannel => {}
-                    }
-                    // JSON rc_frame 兜底（未协商二进制通道时，M4 MVP 兼容）
-                    let payload = rc_frame_payload(&session_id, frame_seq, w, h, &data);
-                    let msg = {
-                        let mut rng_g = rng.lock().unwrap();
-                        let mut seq_g = seq.lock().unwrap();
-                        crate::build_envelope(&mut rng_g, &mut seq_g, "rc_frame", &payload)
-                    };
-                    if let Err(e) = send_ws_text(&mut *writer.lock().unwrap(), msg.as_bytes()) {
-                        eprintln!("[agent] rc_frame 发送失败: {}", e);
-                        break;
-                    }
-                }
+            // 采集源随协商 codec 切换：JPEG 走采集工具；RAW/原生须 RGBA 采集源（§8.3.6）。
+            let raw_mode = media_wants_raw();
+            let cap = if raw_mode { capture_rgba() } else { capture_jpeg() };
+            let (data, w, h) = match cap {
+                Some(t) => t,
                 None => {
                     // 采集不可用：上报未就绪（不造假帧）
                     send_rc_event(&writer, &rng, &seq, &session_id, "notice",
-                        "屏幕采集不可用（缺少 screencapture/scrot/import 或权限）", false, false);
+                        if raw_mode {
+                            "RGBA 采集不可用（缺屏幕录制权限/显示服务）"
+                        } else {
+                            "屏幕采集不可用（缺少 screencapture/scrot/import 或权限）"
+                        }, false, false);
                     break;
                 }
+            };
+            // 二进制媒体环（§8.3）：已协商通道 → 按协商 codec 编码采集帧 → 二进制帧。
+            match send_media_frame(&writer, &data, w, h, frame_seq, started.elapsed().as_millis() as u32) {
+                SendOutcome::Sent => continue,
+                SendOutcome::Broken => {
+                    // 通道损坏：清空回退 JSON 中继（会话不中断）
+                    *RC_MEDIA.lock().unwrap() = None;
+                    send_rc_event(&writer, &rng, &seq, &session_id, "notice",
+                        "媒体通道中断，已回退 JSON 中继", false, false);
+                    if raw_mode {
+                        continue; // RGBA 数据不能冒充当 JPEG；下一轮回采 JPEG 走 JSON 兜底
+                    }
+                }
+                SendOutcome::NoChannel => {
+                    if raw_mode {
+                        continue; // 协商为非 JPEG 但通道已消失：下一轮回采 JPEG 走 JSON 兜底
+                    }
+                }
+            }
+            // JSON rc_frame 兜底（未协商二进制通道时，M4 MVP 兼容）
+            let payload = rc_frame_payload(&session_id, frame_seq, w, h, &data);
+            let msg = {
+                let mut rng_g = rng.lock().unwrap();
+                let mut seq_g = seq.lock().unwrap();
+                crate::build_envelope(&mut rng_g, &mut seq_g, "rc_frame", &payload)
+            };
+            if let Err(e) = send_ws_text(&mut *writer.lock().unwrap(), msg.as_bytes()) {
+                eprintln!("[agent] rc_frame 发送失败: {}", e);
+                break;
             }
         }
         eprintln!("[agent] rc 会话结束 {}", session_id);
@@ -467,6 +632,8 @@ pub fn start_rc(writer: Writer, rng: Arc<Mutex<crate::Lcg>>, seq: Arc<Mutex<u64>
 pub fn stop_rc() {
     RC_STOP.store(true, Ordering::SeqCst);
     RC_GEN.fetch_add(1, Ordering::SeqCst); // 使旧帧循环代次失效
+    RC_WANT_P2P.store(false, Ordering::SeqCst);
+    *RC_SESSION.lock().unwrap() = None;
     // 关闭 P2P 直连（drop TcpStream）并清通道，下次 start_rc 重新协商。
     *RC_MEDIA.lock().unwrap() = None;
 }
@@ -674,7 +841,7 @@ fn inject_input_xdotool(kind: &str, x: f64, y: f64, button: u32, key: &str) -> R
 #[cfg(target_os = "windows")]
 fn inject_input_windows(kind: &str, x: f64, y: f64, button: u32, key: &str) -> Result<(), String> {
     use std::os::raw::{c_int, c_long, c_uint, c_ulong};
-    use win32::*;
+    use self::win32::*;
     unsafe {
         // 绝对坐标需按虚拟桌面归一化到 0..65535
         let vx = GetSystemMetrics(SM_XVIRTUALSCREEN) as f64;
@@ -779,7 +946,7 @@ fn inject_input_windows(kind: &str, x: f64, y: f64, button: u32, key: &str) -> R
 
 #[cfg(target_os = "windows")]
 unsafe fn key_input(vk: u16, down: bool) -> win32::INPUT {
-    use win32::*;
+    use self::win32::*;
     INPUT {
         type_: INPUT_KEYBOARD,
         u: INPUTUNION {
@@ -792,6 +959,345 @@ unsafe fn key_input(vk: u16, down: bool) -> win32::INPUT {
             },
         },
     }
+}
+
+// ===================== RGBA 采集（原生编码器 / RAW 通道数据源，§8.3.6） =====================
+//
+// 采集当前主屏为紧凑 RGBA8（w*h*4）。平台实现：
+// - macOS：CoreGraphics CGDisplayCreateImage → CFData（原生位图为 BGRA8888，交换 B/R）；
+// - Linux：X11 XGetImage（ZPixmap，常见 32bpp BGRX/BGRA，交换 B/R）；
+// - Windows：GDI BitBlt + GetDIBits（BI_RGB 32bpp 自底向上 BGRA，交换 B/R）。
+// 不可用（无权限/无显示/布局不符）返回 None——调用方诚实回退，不造假帧。
+
+#[cfg(target_os = "macos")]
+mod cgcap {
+    use std::os::raw::c_void;
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        pub fn CGMainDisplayID() -> u32;
+        pub fn CGDisplayCreateImage(display: u32) -> *const c_void;
+        pub fn CGImageRelease(image: *const c_void);
+        pub fn CGImageGetWidth(image: *const c_void) -> usize;
+        pub fn CGImageGetHeight(image: *const c_void) -> usize;
+        pub fn CGImageGetBitsPerPixel(image: *const c_void) -> usize;
+        pub fn CGImageGetBytesPerRow(image: *const c_void) -> usize;
+        pub fn CGImageGetDataProvider(image: *const c_void) -> *const c_void;
+        pub fn CGDataProviderCopyData(provider: *const c_void) -> *const c_void;
+    }
+
+    // CFData/CFRelease 属 CoreFoundation（与 CoreGraphics 分离的框架）。
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        pub fn CFDataGetLength(data: *const c_void) -> isize;
+        pub fn CFDataGetBytePtr(data: *const c_void) -> *const u8;
+        pub fn CFRelease(obj: *const c_void);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn capture_rgba_macos() -> Option<(Vec<u8>, usize, usize)> {
+    unsafe {
+        let img = cgcap::CGDisplayCreateImage(cgcap::CGMainDisplayID());
+        if img.is_null() {
+            return None; // 缺屏幕录制权限等
+        }
+        let w = cgcap::CGImageGetWidth(img);
+        let h = cgcap::CGImageGetHeight(img);
+        let bpp = cgcap::CGImageGetBitsPerPixel(img);
+        let row = cgcap::CGImageGetBytesPerRow(img);
+        let provider = cgcap::CGImageGetDataProvider(img);
+        let data = if provider.is_null() {
+            std::ptr::null()
+        } else {
+            cgcap::CGDataProviderCopyData(provider)
+        };
+        let mut out = None;
+        if !data.is_null() && bpp == 32 && w > 0 && h > 0 && row >= w * 4 {
+            let len = cgcap::CFDataGetLength(data) as usize;
+            let ptr = cgcap::CFDataGetBytePtr(data);
+            if !ptr.is_null() && len >= row * h {
+                let src = std::slice::from_raw_parts(ptr, row * h);
+                let mut rgba = vec![0u8; w * h * 4];
+                for y in 0..h {
+                    let s = &src[y * row..y * row + w * 4];
+                    let d = &mut rgba[y * w * 4..(y + 1) * w * 4];
+                    for i in 0..w * 4 {
+                        // BGRA8888（小端 alpha first）→ RGBA：交换 B/R 通道
+                        d[i] = match i % 4 {
+                            0 => s[i + 2],
+                            2 => s[i - 2],
+                            _ => s[i],
+                        };
+                    }
+                }
+                out = Some((rgba, w, h));
+            }
+        }
+        if !data.is_null() {
+            cgcap::CFRelease(data);
+        }
+        cgcap::CGImageRelease(img);
+        out
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod x11cap {
+    use std::os::raw::{c_char, c_int, c_uint, c_ulong};
+
+    #[link(name = "X11")]
+    extern "C" {
+        pub fn XOpenDisplay(name: *const c_char) -> *mut std::os::raw::c_void;
+        pub fn XCloseDisplay(d: *mut std::os::raw::c_void) -> c_int;
+        pub fn XDefaultScreen(d: *mut std::os::raw::c_void) -> c_int;
+        pub fn XRootWindow(d: *mut std::os::raw::c_void, screen: c_int) -> c_ulong;
+        pub fn XDisplayWidth(d: *mut std::os::raw::c_void, screen: c_int) -> c_int;
+        pub fn XDisplayHeight(d: *mut std::os::raw::c_void, screen: c_int) -> c_int;
+        pub fn XGetImage(
+            d: *mut std::os::raw::c_void,
+            drawable: c_ulong,
+            x: c_int,
+            y: c_int,
+            w: c_uint,
+            h: c_uint,
+            plane_mask: c_ulong,
+            format: c_int,
+        ) -> *mut XImage;
+        pub fn XDestroyImage(img: *mut XImage) -> c_int;
+    }
+
+    pub const Z_PIXMAP: c_int = 2;
+    pub const ALL_PLANES: c_ulong = !0u64 as c_ulong;
+
+    /// XImage 布局前缀（Xlib.h 公开 ABI，后续 funcs 字段由 Xlib 自行访问，此处只需读到的字段）。
+    #[repr(C)]
+    pub struct XImage {
+        pub width: c_int,
+        pub height: c_int,
+        pub xoffset: c_int,
+        pub format: c_int,
+        pub data: *mut c_char,
+        pub byte_order: c_int,
+        pub bitmap_unit: c_int,
+        pub bitmap_bit_order: c_int,
+        pub bitmap_pad: c_int,
+        pub depth: c_int,
+        pub bytes_per_line: c_int,
+        pub red_mask: c_ulong,
+        pub green_mask: c_ulong,
+        pub blue_mask: c_ulong,
+        pub obdata: *mut c_char,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn capture_rgba_linux() -> Option<(Vec<u8>, usize, usize)> {
+    unsafe {
+        let d = x11cap::XOpenDisplay(std::ptr::null());
+        if d.is_null() {
+            return None; // 无 X 显示（Wayland/纯头端）
+        }
+        let screen = x11cap::XDefaultScreen(d);
+        let root = x11cap::XRootWindow(d, screen);
+        let w = x11cap::XDisplayWidth(d, screen);
+        let h = x11cap::XDisplayHeight(d, screen);
+        let mut out = None;
+        if w > 0 && h > 0 {
+            let img = x11cap::XGetImage(
+                d,
+                root,
+                0,
+                0,
+                w as u32,
+                h as u32,
+                x11cap::ALL_PLANES,
+                x11cap::Z_PIXMAP,
+            );
+            if !img.is_null() {
+                let pad = (*img).bitmap_pad;
+                let depth = (*img).depth;
+                let row = (*img).bytes_per_line;
+                let data = (*img).data;
+                // TrueColor 32bpp（BGRX/BGRA）或 24bpp 紧凑（BGR）
+                let bpl_target = match pad {
+                    32 => w * 4,
+                    24 => w * 3,
+                    _ => 0,
+                };
+                if !data.is_null() && row >= bpl_target && (depth == 24 || depth == 32) {
+                    let src = std::slice::from_raw_parts(data as *const u8, row as usize * h as usize);
+                    let mut rgba = vec![0u8; w as usize * h as usize * 4];
+                    for y in 0..h as usize {
+                        let s = &src[y * row as usize..];
+                        let drow = &mut rgba[y * w as usize * 4..(y + 1) * w as usize * 4];
+                        for x in 0..w as usize {
+                            let (b, g, r) = if pad == 32 {
+                                (s[x * 4], s[x * 4 + 1], s[x * 4 + 2])
+                            } else {
+                                (s[x * 3], s[x * 3 + 1], s[x * 3 + 2])
+                            };
+                            drow[x * 4] = r;
+                            drow[x * 4 + 1] = g;
+                            drow[x * 4 + 2] = b;
+                            drow[x * 4 + 3] = 0xFF;
+                        }
+                    }
+                    out = Some((rgba, w as usize, h as usize));
+                }
+                x11cap::XDestroyImage(img);
+            }
+        }
+        x11cap::XCloseDisplay(d);
+        out
+    }
+}
+
+#[cfg(target_os = "windows")]
+mod gdicap {
+    use std::os::raw::{c_int, c_uint, c_ushort};
+
+    #[repr(C)]
+    pub struct BITMAPINFOHEADER {
+        pub bi_size: u32,
+        pub bi_width: c_int,
+        pub bi_height: c_int,
+        pub bi_planes: c_ushort,
+        pub bi_bit_count: c_ushort,
+        pub bi_compression: u32,
+        pub bi_size_image: u32,
+        pub bi_x_pels_per_meter: c_int,
+        pub bi_y_pels_per_meter: c_int,
+        pub bi_clr_used: u32,
+        pub bi_clr_important: u32,
+    }
+
+    #[repr(C)]
+    pub struct BITMAPINFO {
+        pub bmi_header: BITMAPINFOHEADER,
+        pub bmi_colors: [u32; 1],
+    }
+
+    #[link(name = "gdi32")]
+    extern "system" {
+        pub fn CreateCompatibleDC(hdc: *mut std::os::raw::c_void) -> *mut std::os::raw::c_void;
+        pub fn DeleteDC(hdc: *mut std::os::raw::c_void) -> c_int;
+        pub fn CreateCompatibleBitmap(hdc: *mut std::os::raw::c_void, cx: c_int, cy: c_int)
+            -> *mut std::os::raw::c_void;
+        pub fn DeleteObject(o: *mut std::os::raw::c_void) -> c_int;
+        pub fn SelectObject(hdc: *mut std::os::raw::c_void, h: *mut std::os::raw::c_void)
+            -> *mut std::os::raw::c_void;
+        pub fn BitBlt(
+            dest: *mut std::os::raw::c_void,
+            x: c_int,
+            y: c_int,
+            cx: c_int,
+            cy: c_int,
+            src: *mut std::os::raw::c_void,
+            sx: c_int,
+            sy: c_int,
+            rop: u32,
+        ) -> c_int;
+        pub fn GetDIBits(
+            hdc: *mut std::os::raw::c_void,
+            bmp: *mut std::os::raw::c_void,
+            start: c_uint,
+            lines: c_uint,
+            bits: *mut u8,
+            info: *mut BITMAPINFO,
+            usage: c_uint,
+        ) -> c_int;
+    }
+
+    pub const SRCCOPY: u32 = 0x00CC_0020;
+    pub const DIB_RGB_COLORS: c_uint = 0;
+    pub const BI_RGB: u32 = 0;
+}
+
+#[cfg(target_os = "windows")]
+fn capture_rgba_windows() -> Option<(Vec<u8>, usize, usize)> {
+    use self::gdicap::*;
+    unsafe {
+        let hdc_screen = win32::GetDC(std::ptr::null_mut());
+        if hdc_screen.is_null() {
+            return None;
+        }
+        let w = win32::GetSystemMetrics(0); // SM_CXSCREEN
+        let h = win32::GetSystemMetrics(1); // SM_CYSCREEN
+        let mut out = None;
+        if w > 0 && h > 0 {
+            let mem = CreateCompatibleDC(hdc_screen);
+            let bmp = CreateCompatibleBitmap(hdc_screen, w, h);
+            if !mem.is_null() && !bmp.is_null() {
+                let old = SelectObject(mem, bmp);
+                if BitBlt(mem, 0, 0, w, h, hdc_screen, 0, 0, SRCCOPY) != 0 {
+                    let mut bi = BITMAPINFO {
+                        bmi_header: BITMAPINFOHEADER {
+                            bi_size: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                            bi_width: w,
+                            bi_height: -h, // 负值 = 自顶向下
+                            bi_planes: 1,
+                            bi_bit_count: 32,
+                            bi_compression: BI_RGB,
+                            bi_size_image: 0,
+                            bi_x_pels_per_meter: 0,
+                            bi_y_pels_per_meter: 0,
+                            bi_clr_used: 0,
+                            bi_clr_important: 0,
+                        },
+                        bmi_colors: [0; 1],
+                    };
+                    let mut buf = vec![0u8; w as usize * h as usize * 4];
+                    let lines = GetDIBits(
+                        mem,
+                        bmp,
+                        0,
+                        h as u32,
+                        buf.as_mut_ptr(),
+                        &mut bi,
+                        DIB_RGB_COLORS,
+                    );
+                    if lines == h {
+                        // BGRA（DIB 32bpp）→ RGBA：交换 B/R
+                        for px in buf.chunks_exact_mut(4) {
+                            px.swap(0, 2);
+                        }
+                        out = Some((buf, w as usize, h as usize));
+                    }
+                }
+                SelectObject(mem, old);
+                DeleteObject(bmp);
+                DeleteDC(mem);
+            }
+        }
+        win32::ReleaseDC(std::ptr::null_mut(), hdc_screen);
+        out
+    }
+}
+
+/// 采集当前主屏为紧凑 RGBA8；平台不可用时返回 None（诚实回退，不造假帧）。
+pub fn capture_rgba() -> Option<(Vec<u8>, usize, usize)> {
+    #[cfg(target_os = "macos")]
+    {
+        capture_rgba_macos()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        capture_rgba_linux()
+    }
+    #[cfg(target_os = "windows")]
+    {
+        capture_rgba_windows()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        None
+    }
+}
+
+/// RGBA 采集可用性探测（协商期调用一次；做一次真实采集后丢弃）。
+pub fn rgba_capture_ok() -> bool {
+    capture_rgba().is_some()
 }
 
 // ===================== 屏幕采集 =====================
@@ -991,12 +1497,39 @@ mod tests {
     }
 
     #[test]
-    fn clamp_runtime_codec_only_jpeg_survives() {
-        // 当前采集链只产 JPEG：其余选择（含原生与 RAW）诚实回退，不假造帧。
-        assert_eq!(clamp_runtime_codec(crate::rc_media::CODEC_JPEG), crate::rc_media::CODEC_JPEG);
-        assert_eq!(clamp_runtime_codec(crate::rc_media::CODEC_H264), crate::rc_media::CODEC_JPEG);
-        assert_eq!(clamp_runtime_codec(crate::rc_media::CODEC_H265), crate::rc_media::CODEC_JPEG);
-        assert_eq!(clamp_runtime_codec(crate::rc_media::CODEC_RAW_RGBA), crate::rc_media::CODEC_JPEG);
+    fn clamp_runtime_codec_respects_probed_capabilities() {
+        // 探测能力驱动：JPEG 恒可用；RAW 需 RGBA 采集源；原生需 RGBA + 原生库。
+        assert_eq!(clamp_runtime_codec(crate::rc_media::CODEC_JPEG, false, false), crate::rc_media::CODEC_JPEG);
+        assert_eq!(clamp_runtime_codec(crate::rc_media::CODEC_JPEG, true, true), crate::rc_media::CODEC_JPEG);
+        assert_eq!(clamp_runtime_codec(crate::rc_media::CODEC_RAW_RGBA, false, false), crate::rc_media::CODEC_JPEG);
+        assert_eq!(clamp_runtime_codec(crate::rc_media::CODEC_RAW_RGBA, true, false), crate::rc_media::CODEC_RAW_RGBA);
+        assert_eq!(clamp_runtime_codec(crate::rc_media::CODEC_H264, true, false), crate::rc_media::CODEC_JPEG);
+        assert_eq!(clamp_runtime_codec(crate::rc_media::CODEC_H264, false, true), crate::rc_media::CODEC_JPEG);
+        assert_eq!(clamp_runtime_codec(crate::rc_media::CODEC_H264, true, true), crate::rc_media::CODEC_H264);
+        assert_eq!(clamp_runtime_codec(crate::rc_media::CODEC_H265, true, true), crate::rc_media::CODEC_H265);
+    }
+
+    #[test]
+    fn native_encoder_probe_false_without_lib() {
+        std::env::remove_var("YUDUAN_ENCODER_LIB");
+        assert!(!native_encoder_ok(crate::rc_media::CODEC_H264));
+        assert!(!native_encoder_ok(crate::rc_media::CODEC_JPEG)); // JPEG 非原生 codec
+    }
+
+    #[test]
+    fn rc_offer_payload_parses_candidates() {
+        // 与 handle_rc_offer 取值表达式一致
+        let j = crate::parse_json(
+            "{\"session_id\":\"s-1\",\"candidates\":[\"192.168.1.10:19001\",\"10.0.0.2:19001\"]}".as_bytes(),
+        )
+        .unwrap();
+        match j.get("candidates") {
+            Some(crate::Json::Arr(a)) => {
+                let v: Vec<&str> = a.iter().filter_map(|x| x.as_str()).collect();
+                assert_eq!(v, vec!["192.168.1.10:19001", "10.0.0.2:19001"]);
+            }
+            _ => panic!("candidates 应为数组"),
+        }
     }
 
     #[test]

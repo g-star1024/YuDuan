@@ -1374,6 +1374,17 @@ fn session(url: &str) -> std::io::Result<()> {
                             rc::handle_rc_select(&ws.writer.clone(), &rng, &seq, &sid, p);
                         }
                     }
+                    // M4 远控（§8.3 ICE-lite）：主端批量/增量上报 P2P 候选地址，逐个尝试直连升级
+                    "rc_offer" => {
+                        if let Some(p) = env.get("payload") {
+                            rc::handle_rc_offer(&ws.writer.clone(), &rng, &seq, p);
+                        }
+                    }
+                    "rc_candidate" => {
+                        if let Some(p) = env.get("payload") {
+                            rc::handle_rc_candidate(&ws.writer.clone(), &rng, &seq, p);
+                        }
+                    }
                     _ => {
                         // 其它类型优雅忽略，不崩溃
                         eprintln!("[agent] 忽略未知/不相关消息类型: {}", msg_type);

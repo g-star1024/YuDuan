@@ -18,6 +18,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"yuduan/internal/proto"
@@ -29,7 +30,10 @@ const (
 	frameVersion   = 1
 	frameHeaderLen = 24
 	codecJPEG      = 1
+	codecRawRGBA   = 0
 )
+
+var codecNames = []string{"raw_rgba", "jpeg", "h264", "h265", "vp8", "vp9", "av1"}
 
 func main() {
 	hub := flag.String("hub", "ws://127.0.0.1:18080", "中枢 viewer WS 地址（不含路径）")
@@ -41,6 +45,7 @@ func main() {
 	frames := flag.Int("frames", 5, "收集满 N 帧即结束")
 	out := flag.String("out", "/tmp/p2pviewer-out", "样例帧输出目录")
 	timeout := flag.Duration("timeout", 25*time.Second, "总体超时")
+	candidates := flag.Bool("candidates", true, "p2p 时广播本机候选地址（ICE-lite：被控端逐个尝试直连）")
 	flag.Parse()
 	if *device == "" {
 		fatal("需指定 -device（被控设备 ID）")
@@ -137,6 +142,7 @@ func main() {
 	started := time.Time{}
 	got, totalBytes := 0, 0
 	selectSent := false
+	codecAdopted := false
 
 	for got < *frames {
 		remaining := time.Until(deadline)
@@ -171,36 +177,55 @@ func main() {
 					if err := conn.WriteMessage(selB); err != nil {
 						fatal("发送 rc_select 失败: %v", err)
 					}
-					selectSent = true
-					logf("已发送 rc_select（transport=%s codec=%d media=%s）", *transport, *codec, addr)
+				selectSent = true
+				logf("已发送 rc_select（transport=%s codec=%d media=%s）", *transport, *codec, addr)
+				// ICE-lite：广播本机候选地址（被控端首跳失败时逐个尝试直连升级）。
+				if *transport == "p2p" && *candidates {
+					sendCandidates(conn, sessionID, ln)
 				}
-			case proto.TypeRCEvent:
-				var p proto.RCEventPayload
-				_ = env.DecodePayload(&p)
-				logf("事件[%s]: %s", p.Kind, p.Message)
-				if p.Kind == "error" {
-					fatal("被控端报错: %s", p.Message)
 				}
+		case proto.TypeRCEvent:
+			var p proto.RCEventPayload
+			_ = env.DecodePayload(&p)
+			logf("事件[%s]: %s", p.Kind, p.Message)
+			if p.Kind == "error" {
+				fatal("被控端报错: %s", p.Message)
+			}
+			// 被控端可能诚实回退编解码器（如选 h265 但无原生库 → jpeg）：
+			// 从 media_selected 事件末尾的 codec 名采纳实际值，避免误判有效帧。
+			if p.Kind == "media_selected" && !codecAdopted {
+				if name := lastToken(p.Message); name != "" {
+					for i, n := range codecNames {
+						if n == name {
+							*codec = i
+							codecAdopted = true
+							logf("采纳被控端实际编解码器: %s", name)
+							break
+						}
+					}
+				}
+			}
 			case proto.TypeRCStop:
 				fatal("会话被结束（仅 %d/%d 帧）", got, *frames)
 			}
-		case frame, ok := <-frameCh:
-			if !ok {
-				fatal("帧通道关闭（仅 %d/%d 帧）", got, *frames)
-			}
-			codecGot, payload, err := checkFrame(frame, *codec)
-			if err != nil {
-				logf("丢弃无效帧: %v", err)
-				continue
-			}
-			if got == 0 {
-				started = time.Now()
-			}
-			got++
-			totalBytes += len(payload)
-			saved := saveFrame(*out, got, codecGot, payload)
-			logf("帧 #%d ok: codec=%s %d 字节载荷 → %s", got, codecName(codecGot), len(payload), saved)
+	case frame, ok := <-frameCh:
+		if !ok {
+			fatal("帧通道关闭（仅 %d/%d 帧）", got, *frames)
 		}
+		codecGot, fw, fh, payload, err := checkFrame(frame, *codec)
+		if err != nil {
+			logf("丢弃无效帧: %v", err)
+			continue
+		}
+		if got == 0 {
+			started = time.Now()
+			logf("首帧头 8 字节: % x（%s 帧用于校验编码器输出特征）", payload[:min(8, len(payload))], codecName(codecGot))
+		}
+		got++
+		totalBytes += len(payload)
+		saved := saveFrame(*out, got, codecGot, payload)
+		logf("帧 #%d ok: codec=%s %dx%d %d 字节载荷 → %s", got, codecName(codecGot), fw, fh, len(payload), saved)
+	}
 	}
 
 	elapsed := time.Since(started)
@@ -218,29 +243,103 @@ func main() {
 }
 
 // checkFrame 校验二进制媒体帧格式；wantCodec>0 时还要求编解码器与协商值一致。
-func checkFrame(b []byte, wantCodec int) (byte, []byte, error) {
+// 返回（编解码器, 宽, 高, payload）。RAW_RGBA 帧额外校验载荷长度 == 宽*高*4。
+func checkFrame(b []byte, wantCodec int) (byte, int, int, []byte, error) {
 	if len(b) < frameHeaderLen {
-		return 0, nil, fmt.Errorf("帧过短 %d < %d", len(b), frameHeaderLen)
+		return 0, 0, 0, nil, fmt.Errorf("帧过短 %d < %d", len(b), frameHeaderLen)
 	}
 	if binary.LittleEndian.Uint32(b[0:4]) != frameMagic {
-		return 0, nil, errors.New("magic 不匹配")
+		return 0, 0, 0, nil, errors.New("magic 不匹配")
 	}
 	if b[4] != frameVersion {
-		return 0, nil, fmt.Errorf("帧版本 %d 不支持", b[4])
+		return 0, 0, 0, nil, fmt.Errorf("帧版本 %d 不支持", b[4])
 	}
 	codec := b[6]
+	w := int(binary.LittleEndian.Uint16(b[12:14]))
+	h := int(binary.LittleEndian.Uint16(b[14:16]))
 	ln := int(binary.LittleEndian.Uint32(b[20:24]))
 	if len(b) < frameHeaderLen+ln {
-		return 0, nil, fmt.Errorf("载荷截断: 声明 %d 实际 %d", ln, len(b)-frameHeaderLen)
+		return 0, 0, 0, nil, fmt.Errorf("载荷截断: 声明 %d 实际 %d", ln, len(b)-frameHeaderLen)
 	}
 	payload := b[frameHeaderLen : frameHeaderLen+ln]
 	if wantCodec > 0 && int(codec) != wantCodec {
-		return 0, nil, fmt.Errorf("编解码器 %d 非协商值 %d", codec, wantCodec)
+		return 0, 0, 0, nil, fmt.Errorf("编解码器 %d 非协商值 %d", codec, wantCodec)
 	}
 	if codec == codecJPEG && (len(payload) < 2 || payload[0] != 0xFF || payload[1] != 0xD8) {
-		return 0, nil, errors.New("JPEG 载荷缺 SOI 标记")
+		return 0, 0, 0, nil, errors.New("JPEG 载荷缺 SOI 标记")
 	}
-	return codec, payload, nil
+	if codec == codecRawRGBA {
+		if w == 0 || h == 0 {
+			return 0, 0, 0, nil, errors.New("RAW 帧宽高为 0")
+		}
+		if len(payload) != w*h*4 {
+			return 0, 0, 0, nil, fmt.Errorf("RAW 载荷长度 %d != %dx%dx4", len(payload), w, h)
+		}
+	}
+	return codec, w, h, payload, nil
+}
+
+// sendCandidates 广播 ICE-lite 候选：
+//   - 监听绑定具体 IP（如 127.0.0.1）→ 唯一候选即该地址（拨别的地址必然被拒）；
+//   - 监听绑定通配地址（0.0.0.0 / ::）→ 枚举本机非回送网卡 IPv4 + 监听端口。
+// 先发 rc_offer（批量），再逐个 rc_candidate（增量，与协议 §8.3 一致）。
+func sendCandidates(conn *ws.Conn, sessionID string, ln net.Listener) {
+	host, port, err := net.SplitHostPort(ln.Addr().String())
+	if err != nil {
+		logf("候选收集失败（监听地址解析）: %v", err)
+		return
+	}
+	var cands []string
+	if ip := net.ParseIP(host); ip != nil && !ip.IsUnspecified() {
+		cands = []string{net.JoinHostPort(ip.String(), port)}
+	} else {
+		ifaces, err := net.Interfaces()
+		if err != nil {
+			logf("候选收集失败（枚举网卡）: %v", err)
+			return
+		}
+		for _, ifc := range ifaces {
+			if ifc.Flags&net.FlagUp == 0 || ifc.Flags&net.FlagLoopback != 0 {
+				continue
+			}
+			addrs, err := ifc.Addrs()
+			if err != nil {
+				continue
+			}
+			for _, a := range addrs {
+				var ip net.IP
+				switch v := a.(type) {
+				case *net.IPNet:
+					ip = v.IP
+				case *net.IPAddr:
+					ip = v.IP
+				}
+				if ip == nil || ip.IsLoopback() || ip.To4() == nil {
+					continue // 仅 IPv4（媒体环当前按 IPv4 拨号）
+				}
+				cands = append(cands, net.JoinHostPort(ip.String(), port))
+			}
+		}
+	}
+	if len(cands) == 0 {
+		return
+	}
+	offer, err := proto.NewEnvelope(proto.TypeRCOffer, 0, proto.RCOfferPayload{SessionID: sessionID, Candidates: cands})
+	if err == nil {
+		if b, err := json.Marshal(offer); err == nil {
+			_ = conn.WriteMessage(b)
+		}
+	}
+	for _, c := range cands {
+		cm, err := proto.NewEnvelope(proto.TypeRCCandidate, 0, proto.RCCandidatePayload{SessionID: sessionID, Candidate: c})
+		if err != nil {
+			continue
+		}
+		if b, err := json.Marshal(cm); err == nil {
+			_ = conn.WriteMessage(b)
+		}
+	}
+	logf("已广播 %d 个 ICE-lite 候选: %v", len(cands), cands)
 }
 
 func saveFrame(dir string, n int, codec byte, payload []byte) string {
@@ -249,8 +348,8 @@ func saveFrame(dir string, n int, codec byte, payload []byte) string {
 		return "(未落盘)"
 	}
 	ext := ".bin"
-	if codec == codecJPEG {
-		ext = ".jpg"
+	if int(codec) < len(codecNames) {
+		ext = "." + codecNames[codec]
 	}
 	path := filepath.Join(dir, fmt.Sprintf("frame-%03d%s", n, ext))
 	if err := os.WriteFile(path, payload, 0o644); err != nil {
@@ -258,6 +357,15 @@ func saveFrame(dir string, n int, codec byte, payload []byte) string {
 		return "(未落盘)"
 	}
 	return path
+}
+
+// lastToken 取消息末尾以空白分隔的最后一个词（media_selected 消息以 codec 名结尾）。
+func lastToken(s string) string {
+	f := strings.Fields(s)
+	if len(f) == 0 {
+		return ""
+	}
+	return f[len(f)-1]
 }
 
 func payloadOK(env proto.Envelope) any {
@@ -269,9 +377,8 @@ func payloadOK(env proto.Envelope) any {
 }
 
 func codecName(c byte) string {
-	names := []string{"raw_rgba", "jpeg", "h264", "h265", "vp8", "vp9", "av1"}
-	if int(c) < len(names) {
-		return names[c]
+	if int(c) < len(codecNames) {
+		return codecNames[c]
 	}
 	return fmt.Sprintf("codec:%d", c)
 }

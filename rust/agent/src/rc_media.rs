@@ -188,14 +188,19 @@ pub fn parse_capabilities(s: &str) -> Option<Capabilities> {
 }
 
 /// Agent 默认可产出编解码器：RAW_RGBA + JPEG 始终可用（纯 Rust 回退）；
-/// 若配置了 YUDUAN_ENCODER_LIB，原生编解码器（H264/H265/VP8/VP9/AV1）一并宣告。
+/// 配置了 YUDUAN_ENCODER_LIB 时，逐个探测原生编解码器（H264/H265/VP8/VP9/AV1），
+/// 仅宣告库真实支持（能创建句柄）的——不虚标能力。
 pub fn agent_codecs() -> Vec<u8> {
     let mut v = vec![CODEC_RAW_RGBA, CODEC_JPEG];
     if std::env::var("YUDUAN_ENCODER_LIB")
         .map(|s| !s.trim().is_empty())
         .unwrap_or(false)
     {
-        v.extend_from_slice(&[CODEC_H264, CODEC_H265, CODEC_VP8, CODEC_VP9, CODEC_AV1]);
+        for &c in &[CODEC_H264, CODEC_H265, CODEC_VP8, CODEC_VP9, CODEC_AV1] {
+            if NativeEncoder::try_load(c).is_some() {
+                v.push(c);
+            }
+        }
     }
     v
 }
