@@ -15,9 +15,16 @@ MFT，Windows 8+ 无需额外安装；其余 codec `create` 返回 NULL，副端
 
 ```cmd
 build-windows.cmd
+build-harness.cmd
+:: 直测（与 encoder-vt/harness.c 同构的 Windows 版，LoadLibraryA 加载）：
+enc_harness.exe %TEMP%\yuduan_enc_mf.dll h264 1280 720 60 out.h264
+:: out.h264 用 ffprobe/ffplay 交叉验证；通过后再接入副端走全链路（见 dev/verify-windows.md）
 set YUDUAN_ENCODER_LIB=%TEMP%\yuduan_enc_mf.dll
-:: 启动副端，能力宣告应含 h264；或跑仓库内 e2e_vt_encoder.py（同脚本复用）
+:: 启动副端，能力宣告应含 h264
 ```
+
+直测工具 `harness-win.c` 与 `encoder-vt/harness.c` 逐行同构（仅 dlopen→LoadLibraryA
+差异），保证三平台编码器验证口径一致。
 
 ## 实现要点
 
