@@ -1,0 +1,28 @@
+[package]
+name = "yuduan-main"
+version = "0.1.0"
+description = "御端 · 终端统一管理平台 主端桌面客户端"
+edition = "2021"
+
+# 见 lib.rs：desktop 入口
+[lib]
+name = "yuduan_main_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+# 无头验收二进制：对真实 hub 跑登录/设备/指令（curl 同口径），CI/开发联调用
+[[bin]]
+name = "hubcheck"
+path = "src/bin/hubcheck.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
