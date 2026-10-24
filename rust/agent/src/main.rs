@@ -35,6 +35,22 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+/// 单测用的**进程级互斥锁**。
+///
+/// 凡读写进程全局状态的单测（环境变量 `YUDUAN_RC_FPS` / `YUDUAN_ENCODER_LIB` /
+/// `YUDUAN_STATE_FILE`，以及 rc.rs 的 `RC_FPS_QOS` / `RC_RTT_MS` 等 static 原子量）
+/// **必须先取本锁**，否则 cargo test 并行执行时会互相踩踏，表现为偶发失败。
+/// 历史事故：`rc_rtt_cap_applies_over_target_fps` 在满量并行下被相邻用例的
+/// `handle_rc_qos` 改写 `RC_RTT_MS`，单独跑必过、全量跑偶发失败。
+#[cfg(test)]
+pub(crate) static TEST_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+/// 取测试锁（锁中毒时直接接管，避免一个失败用例拖垮其余用例）。
+#[cfg(test)]
+pub(crate) fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+    TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 mod agentstate;
 mod ed25519;
 mod httpget;

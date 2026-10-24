@@ -1926,6 +1926,7 @@ mod tests {
 
     #[test]
     fn native_encoder_probe_false_without_lib() {
+        let _g = crate::test_lock(); // 进程全局状态互斥（并行测试隔离）
         std::env::remove_var("YUDUAN_ENCODER_LIB");
         assert!(!native_encoder_ok(crate::rc_media::CODEC_H264));
         assert!(!native_encoder_ok(crate::rc_media::CODEC_JPEG)); // JPEG 非原生 codec
@@ -1933,6 +1934,7 @@ mod tests {
 
     #[test]
     fn rc_offer_payload_parses_candidates() {
+        let _g = crate::test_lock(); // 进程全局状态互斥（并行测试隔离）
         // 与 handle_rc_offer 取值表达式一致
         let j = crate::parse_json(
             "{\"session_id\":\"s-1\",\"candidates\":[\"192.168.1.10:19001\",\"10.0.0.2:19001\"]}".as_bytes(),
@@ -1995,6 +1997,7 @@ mod tests {
 
     #[test]
     fn rc_frame_interval_obeys_env_and_default() {
+        let _g = crate::test_lock(); // 进程全局状态互斥（并行测试隔离）
         // 默认帧率来自 capabilities.fps（15 → 66ms/帧），环境变量可覆盖，非法值回退默认。
         std::env::remove_var("YUDUAN_RC_FPS");
         let d = rc_frame_interval_ms();
@@ -2014,6 +2017,7 @@ mod tests {
 
     #[test]
     fn rc_qos_override_drives_interval_and_clamps() {
+        let _g = crate::test_lock(); // 进程全局状态互斥（并行测试隔离）
         // §8.3.9 带宽自适应闭环：rc_qos 反馈优先级高于环境变量与默认值；
         // 越界（负数/超大/非数字）不应用；0 = 恢复默认（清覆盖）。
         std::env::remove_var("YUDUAN_RC_FPS");
@@ -2081,6 +2085,7 @@ mod tests {
 
     #[test]
     fn rc_qos_loss_and_kbps_apply() {
+        let _g = crate::test_lock(); // 进程全局状态互斥（并行测试隔离）
         // §8.3.15：rc_qos.loss_pct/kbps 到达 → 丢包档位原子量 + 码率目标阶梯生效；
         // 越界载荷忽略；interval 与 RTT 档位取 min。
         RC_FPS_QOS.store(0, Ordering::SeqCst);
@@ -2122,6 +2127,7 @@ mod tests {
 
     #[test]
     fn rc_rtt_cap_applies_over_target_fps() {
+        let _g = crate::test_lock(); // 进程全局状态互斥（并行测试隔离）
         // §8.3.11 传输级自适应：RTT 档位上限与目标 fps 取 min；rc_qos.rtt_ms 越界忽略。
         RC_FPS_QOS.store(0, Ordering::SeqCst);
         RC_RTT_MS.store(0, Ordering::SeqCst);

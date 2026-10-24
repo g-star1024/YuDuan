@@ -652,6 +652,7 @@ mod tests {
 
     #[test]
     fn make_encoder_falls_back_without_native_lib() {
+        let _g = crate::test_lock(); // 进程全局状态互斥（并行测试隔离）
         // 未配置 YUDUAN_ENCODER_LIB：原生编解码器回退 RAW_RGBA，JPEG 走透传。
         std::env::remove_var("YUDUAN_ENCODER_LIB");
         let e = make_encoder(CODEC_H264, 640, 360);
@@ -664,6 +665,7 @@ mod tests {
 
     #[test]
     fn native_encoder_load_fails_gracefully() {
+        let _g = crate::test_lock(); // 进程全局状态互斥（并行测试隔离）
         // 未配置 / 文件不存在 → try_load 返回 None（不影响回退）。
         std::env::remove_var("YUDUAN_ENCODER_LIB");
         assert!(NativeEncoder::try_load(CODEC_H264, 640, 360).is_none());

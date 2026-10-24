@@ -382,3 +382,59 @@ Windows 实机验证发现的 Go 侧 off-by-one（4 字节起始码多跳 1 字�
   `internal/annexb/annexb_test.go`，Python 跑 `annexb_stat.py --selftest`；改动
   任何一侧必须同步向量并在另一侧复跑。已知行为差异（有意保留）：Python 对 NAL
   尾部对齐零 rstrip（统计显示口径），Go 保留原字节（校验口径）。
+
+### 8.3.18 主端 P2P 直连 + 原生解码器 C-ABI（2026-10-24 夜间，端到端已验证）
+
+Tauri 主端补齐 §8.3 ICE-lite 的**另一半**（此前只有 p2pviewer CLI 能当接受方），
+并给出与 §8.3.3 编码器对称的解码器契约。协议零改动，仅新增主端侧实现与 C-ABI。
+
+#### 8.3.18.1 主端 P2P 监听与候选收集
+
+- 监听：`P2pListener::bind("0.0.0.0:0")`（默认系统分配端口，`YUDUAN_P2P_BIND` 可覆盖），非阻塞 accept。
+- 候选收集（与 p2pviewer `sendCandidates` 同口径，两端行为必须一致）：
+  - 绑定具体 IP → 唯一候选即该地址；
+  - 通配绑定 → 枚举本机非回送网卡 IPv4 + 监听端口。
+  - 三平台实现：Unix `getifaddrs`、`Windows GetIpAddrTable`（铁律 2 同构要求）。
+- 广播：紧随 `rc_select`（`transport:"p2p"` + `media_addr:候选[0]`）之后发
+  `rc_offer`（批量）+ `rc_candidate`（增量），与 §8.3.3 ICE-lite 一致。
+- 收帧：直连流按「4B 小端长度前缀 + 帧体」切分（`FrameAssembler`，与副端同构）→
+  24B 帧头解析 → 与 relay 二进制帧汇入同一渲染出口。
+- **通道优先级**：直连建立后到达的中继帧仅计数不渲染，避免双路画面撕裂。
+
+#### 8.3.18.2 原生解码器 C-ABI（与 §8.3.3 编码器对称）
+
+```c
+void*    yuduan_dec_create(const char* codec, uint32_t width, uint32_t height);
+uint32_t yuduan_dec_decode(void* h, const uint8_t* data, uint32_t len,
+                           uint8_t* out, uint32_t out_cap);
+uint32_t yuduan_dec_out_size(void* h);
+void     yuduan_dec_destroy(void* h);
+```
+
+- 输入 **Annex-B**（`00 00 00 01` / `00 00 01` 起始码，与副端 VT 编码器输出一致）；
+  输出 **RGBA8**（紧凑 w*h*4）。
+- 参数集（H.264: SPS/PPS；HEVC: VPS/SPS/PPS）从码流中提取建
+  `CMVideoFormatDescription`，**解码器可随时起播**，不依赖带外协商。
+- 返回值 `0` = 本帧未产出图像（未拿到参数集 / 解码失败 / 缓冲不足）。调用方按
+  「等下一个关键帧」处理，**严禁填充黑帧冒充解码成功**（铁律 6）。
+- 仅接受 `h264` / `h265`，其余返回 NULL——与副端 `NativeEncoder::try_load` 同口径，
+  主端**能力宣告不虚标**：解码器装载失败时不选原生码流，回落 JPEG 并发 `notice`。
+- 输出像素格式：优先向 VT 请求 `32BGRA` 直出（BGRA→RGBA 重排即可上屏），
+  失败降级 `420v`（NV12）并做 YUV→RGBA 转换（BT.601）。
+
+#### 8.3.18.3 验证证据（真实 hub + Rust 副端 + 本机屏幕采集）
+
+`dev/e2e_tauri_p2p.py` 9/9 PASS：
+
+| 项 | 实测 |
+|---|---|
+| 能力宣告 | `codecs=[0,1,2,3]`（副端挂 VT 编码器库） |
+| 协商 | `rc_select codec=2(h264) transport=p2p media_addr=192.168.1.24:51100` |
+| 直连建立 | 1040 ms（ICE-lite 首跳即中） |
+| P2P 首帧 | 1240 ms，seq=1，1728×1080，payload 482 B |
+| 原生解码 | 70/70 帧成功（尺寸 = w*h*4，且非纯色，排除「假解码」） |
+| 带宽对比 | P2P h264 **853 kbps / 6.9 fps** vs relay JPEG **13865 kbps / 5.6 fps**（≈1/16） |
+| relay 回归 | `mediacheck` ALL PASS（34 帧 / 6.1s），T-2 链路未破坏 |
+
+自检 harness（`main/decoder-vt/harness.c`）：编码→解码真实往返 12/12 帧，
+解码均值 R=126.3（原图 127.5），MAD=7.1；`create(vp9)` 拒接、垃圾输入返回 0。

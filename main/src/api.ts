@@ -56,10 +56,28 @@ export function hubDeviceCmd(
   return invoke("hub_device_cmd", { base, token, deviceId, action, command });
 }
 
-// —— 远控会话（T-2 relay） ——
+// —— 远控会话（T-2 relay / T-3 P2P 直连）——
 
-export function rcStart(base: string, deviceId: string, operator: string): Promise<string> {
-  return invoke("rc_start", { base, deviceId, operator });
+/**
+ * 发起远控。
+ * @param transport auto=优先 P2P 直连（失败落中继）/ p2p=仅直连 / relay=仅中继
+ * @param decoderLib 原生解码器库路径（空 = 不启用原生码流，只选 JPEG/RAW）
+ */
+export function rcStart(
+  base: string,
+  deviceId: string,
+  operator: string,
+  transport: string = "auto",
+  decoderLib?: string
+): Promise<string> {
+  return invoke("rc_start", {
+    base,
+    deviceId,
+    operator,
+    transport,
+    decoderLib: decoderLib ?? null,
+    bind: null,
+  });
 }
 
 export function rcStop(): Promise<void> {

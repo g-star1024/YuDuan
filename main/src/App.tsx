@@ -88,6 +88,8 @@ export default function App() {
   const [rcStats, setRcStats] = useState("");
   const [rcConsent, setRcConsent] = useState("");
   const [fpsTarget, setFpsTarget] = useState(15);
+  // T-3：传输路径选择（auto=优先 P2P 直连，失败自动落中继）
+  const [transport, setTransport] = useState<"auto" | "p2p" | "relay">("auto");
 
   useEffect(() => {
     if (page !== "viewer") return;
@@ -118,7 +120,8 @@ export default function App() {
         const id = new ImageData(raw, f.width, f.height);
         canvas.getContext("2d")?.putImageData(id, 0, 0);
       } else {
-        setRcStats(`（codec=${f.codec} 待 T-3 原生解码，帧序号 ${f.seq}）`);
+        // 未渲染的 codec（原生码流已由 Rust 侧解码为 RAW_RGBA 后到达，见 decoder.rs）
+        setRcStats(`（codec=${f.codec} 未渲染，帧序号 ${f.seq}）`);
       }
     }).then((u) => unsubs.push(u));
     listen<{ phase: string; detail: string }>("rc-status", (e) => {
@@ -147,7 +150,7 @@ export default function App() {
     setPage("viewer");
     setSelected(d);
     setRcStatus("发起中…");
-    await rcStart(base, d.id, username);
+    await rcStart(base, d.id, username, transport);
   }
 
   function viewerInput(kind: string, e: React.MouseEvent | React.KeyboardEvent | React.WheelEvent) {
@@ -353,6 +356,14 @@ export default function App() {
                 onChange={(e) => setFpsTarget(Number(e.target.value))}
               />
               {fpsTarget}
+            </label>
+            <label className="fps-label">
+              传输
+              <select value={transport} onChange={(e) => setTransport(e.target.value as "auto" | "p2p" | "relay")}>
+                <option value="auto">自动（优先直连）</option>
+                <option value="p2p">仅直连（P2P）</option>
+                <option value="relay">仅中继</option>
+              </select>
             </label>
           </div>
           <div className="viewer-stage">

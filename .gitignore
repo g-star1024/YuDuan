@@ -28,3 +28,8 @@ dev/sca
 # 编码器/测试编译产物（源码与 build.sh 入库，二进制不入）
 dev/encoder-vt/*.dylib
 dev/encoder-vt/harness
+main/decoder-vt/*.dylib
+main/decoder-vt/harness
+
+# Rust 副端：正式构建走 rustc（无 cargo 依赖）；Cargo.lock 仅为本地单测副产物
+rust/agent/Cargo.lock

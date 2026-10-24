@@ -74,6 +74,7 @@ mod tests {
 
     #[test]
     fn state_roundtrip_with_env_file() {
+        let _g = crate::test_lock(); // 进程全局状态互斥（并行测试隔离）
         let path = std::env::temp_dir().join(format!("yd-state-test-{}.json", std::process::id()));
         std::env::set_var("YUDUAN_STATE_FILE", &path);
         std::fs::remove_file(&path).ok();

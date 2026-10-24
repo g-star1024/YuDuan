@@ -6,14 +6,17 @@
 //   hub_client  —— 中枢控制面：登录/改密/设备台账/指令下发（REST，hub API 同口径）
 //   media       —— 媒体环主端侧（§8.3）：24B 帧头 + 4B 长度前缀分帧 + 丢包统计
 //
-// T-3 的 decoder（VT FFI）将随后续里程碑接入。
+//   p2p          —— P2P 直连主端侧：监听 + ICE-lite 候选 + 直连收帧（T-3）
+//   decoder      —— 原生解码器 FFI（§8.3.18，T-3：macOS VT 先行）
+pub mod decoder;
 pub mod http;
 pub mod hub_client;
 pub mod media;
 pub mod media_session;
+pub mod p2p;
 pub mod wsclient;
 
-use media_session::SessionHandle;
+use media_session::{SessionHandle, SessionOpts};
 use std::sync::Mutex as StdMutex;
 
 /// 当前活动远控会话（单会话模型：新会话顶替旧会话）
@@ -77,14 +80,28 @@ fn hub_device_cmd(
 
 // —— 远控会话（T-2 relay 路径，§8.3） ——
 
-/// 发起远控（relay 中继）：连接 hub /ws/viewer，事件流见 media_session。
+/// 发起远控。transport: auto（优先 P2P 直连，失败落中继）/ p2p / relay；
+/// decoder_lib 为空则只选 JPEG/RAW（不虚标原生码流能力）。
 #[tauri::command]
-fn rc_start(app: tauri::AppHandle, base: String, device_id: String, operator: String) -> Result<String, String> {
+fn rc_start(
+    app: tauri::AppHandle,
+    base: String,
+    device_id: String,
+    operator: String,
+    transport: Option<String>,
+    decoder_lib: Option<String>,
+    bind: Option<String>,
+) -> Result<String, String> {
     // 单会话：已有会话先停
     if let Some(old) = SESSION.lock().unwrap().take() {
         old.stop();
     }
-    let h = media_session::start_relay(app, base, device_id, operator)?;
+    let opts = SessionOpts {
+        transport: transport.unwrap_or_else(|| "auto".into()),
+        bind: bind.filter(|s| !s.is_empty()).unwrap_or_else(|| "0.0.0.0:0".into()),
+        decoder_lib: decoder_lib.unwrap_or_else(|| std::env::var("YUDUAN_DECODER_LIB").unwrap_or_default()),
+    };
+    let h = media_session::start(app, base, device_id, operator, opts)?;
     let sid = h.session_id.clone();
     *SESSION.lock().unwrap() = Some(h);
     Ok(sid)
