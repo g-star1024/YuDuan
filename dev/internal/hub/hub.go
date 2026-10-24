@@ -68,16 +68,16 @@ type HubConfig struct {
 
 // Hub 是中枢核心结构。
 type Hub struct {
-	store    store.Store
-	auditor  audit.Auditor
-	users    auth.UserStore
-	authSvc  *auth.AuthService
-	secret   string
-	enforce  bool
-	dirSync  *directory.SyncEngine
+	store   store.Store
+	auditor audit.Auditor
+	users   auth.UserStore
+	authSvc *auth.AuthService
+	secret  string
+	enforce bool
+	dirSync *directory.SyncEngine
 
 	mu       sync.Mutex
-	conns    map[string]*ws.Conn   // deviceID -> 控制面长连接
+	conns    map[string]*ws.Conn // deviceID -> 控制面长连接
 	pending  map[string]chan proto.ResultPayload
 	sessions map[string]*RCSession // deviceID -> 远控会话
 	software map[string]*proto.SoftwareItem
@@ -90,11 +90,11 @@ type Hub struct {
 	signSeed []byte // Ed25519 种子（可能为空）
 	signPub  string // 由 signSeed 派生的公钥 hex（可能为空）
 
-	recEnabled bool
-	recDir     string
+	recEnabled   bool
+	recDir       string
 	recRetention int
-	recKey     []byte
-	stopJanitor func()
+	recKey       []byte
+	stopJanitor  func()
 }
 
 // NewHub 构造中枢，缺省回退到内存实现。
@@ -121,25 +121,25 @@ func NewHub(cfg HubConfig) *Hub {
 		hubID = "hub-" + host
 	}
 	h := &Hub{
-		store:      cfg.Store,
-		auditor:    cfg.Auditor,
-		users:      cfg.Users,
-		authSvc:    cfg.Auth,
-		secret:     cfg.HMACSecret,
-		enforce:    cfg.HMACEnforce,
-		dirSync:    cfg.DirSync,
-		conns:      make(map[string]*ws.Conn),
-		pending:    make(map[string]chan proto.ResultPayload),
-		sessions:   make(map[string]*RCSession),
-		software:   make(map[string]*proto.SoftwareItem),
-		repoDir:    cfg.RepoDir,
-		hubID:      hubID,
-		publicAddr: cfg.PublicAddr,
-		signSeed:   cfg.SignSeed,
-		recEnabled: cfg.RecordEnabled,
-		recDir:     cfg.RecordDir,
+		store:        cfg.Store,
+		auditor:      cfg.Auditor,
+		users:        cfg.Users,
+		authSvc:      cfg.Auth,
+		secret:       cfg.HMACSecret,
+		enforce:      cfg.HMACEnforce,
+		dirSync:      cfg.DirSync,
+		conns:        make(map[string]*ws.Conn),
+		pending:      make(map[string]chan proto.ResultPayload),
+		sessions:     make(map[string]*RCSession),
+		software:     make(map[string]*proto.SoftwareItem),
+		repoDir:      cfg.RepoDir,
+		hubID:        hubID,
+		publicAddr:   cfg.PublicAddr,
+		signSeed:     cfg.SignSeed,
+		recEnabled:   cfg.RecordEnabled,
+		recDir:       cfg.RecordDir,
 		recRetention: cfg.RecordRetentionDays,
-		recKey:     cfg.RecordKey,
+		recKey:       cfg.RecordKey,
 	}
 	if h.recEnabled {
 		if h.recDir == "" {
@@ -348,9 +348,10 @@ func (h *Hub) handleAdminUsers(w http.ResponseWriter, r *http.Request, _ crypto.
 }
 
 // handleAdminUserAction 账号级管理动作（admin）：
-//   POST /api/v1/admin/users/{name}/force-password-change  强制改密
-//   POST /api/v1/admin/users/{name}/disable                禁用
-//   POST /api/v1/admin/users/{name}/enable                 启用
+//
+//	POST /api/v1/admin/users/{name}/force-password-change  强制改密
+//	POST /api/v1/admin/users/{name}/disable                禁用
+//	POST /api/v1/admin/users/{name}/enable                 启用
 func (h *Hub) handleAdminUserAction(w http.ResponseWriter, r *http.Request, claims crypto.Claims) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)

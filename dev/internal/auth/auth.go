@@ -75,8 +75,8 @@ func NewAuthService(store UserStore, secret, pepper string) *AuthService {
 
 // LoginResult 登录成功后的会话信息。
 type LoginResult struct {
-	Token             string
-	Role              string
+	Token              string
+	Role               string
 	MustChangePassword bool
 }
 

@@ -11,7 +11,9 @@ import (
 
 // TestPostgresPersistence 是针对真实 PostgreSQL 的集成测试，默认跳过。
 // 运行方式（本地有 PG 时）：
-//   YUDUAN_TEST_DSN="host=127.0.0.1 port=5432 user=postgres dbname=yuduan" go test ./internal/store/ -run TestPostgres -v
+//
+//	YUDUAN_TEST_DSN="host=127.0.0.1 port=5432 user=postgres dbname=yuduan" go test ./internal/store/ -run TestPostgres -v
+//
 // 验证点：建表迁移 / 设备 Upsert+跨连接持久化（模拟中枢重启）/ 审计落库 / 用户存储。
 func TestPostgresPersistence(t *testing.T) {
 	dsn := os.Getenv("YUDUAN_TEST_DSN")

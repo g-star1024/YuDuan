@@ -133,9 +133,9 @@ func (c *Conn) QueryArgs(sql string, args ...any) ([]string, [][]string, error) 
 	}
 	// Bind
 	var bind []byte
-	bind = append(bind, cstring("")...)  // portal
-	bind = append(bind, cstring("")...)  // statement
-	bind = append(bind, u16(0)...)       // 结果格式全部文本
+	bind = append(bind, cstring("")...) // portal
+	bind = append(bind, cstring("")...) // statement
+	bind = append(bind, u16(0)...)      // 结果格式全部文本
 	bind = append(bind, u16(len(args))...)
 	for _, a := range args {
 		bind = append(bind, encodeParam(a)...)
@@ -323,8 +323,8 @@ func parseErr(body []byte) string {
 
 // Pool 是最小连接池：有界并发、空闲复用、坏连接自动剔除、满载等待。
 type Pool struct {
-	dial      func() (*Conn, error)
-	maxTotal  int
+	dial       func() (*Conn, error)
+	maxTotal   int
 	idleTarget int
 
 	mu     sync.Mutex

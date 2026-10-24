@@ -2,6 +2,7 @@
 // WORM（一次写入多次读取）保障：
 //   - 每条记录携带 prev_hash/hash 组成哈希链，任何篡改都会被 VerifyChain 发现；
 //   - PostgreSQL 侧另有 BEFORE UPDATE/DELETE 触发器 + REVOKE 权限双保险（见 store/postgres.go migrate）。
+//
 // Auditor 接口同时被内存实现与 PostgreSQL 实现遵循。
 package audit
 

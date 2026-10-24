@@ -16,7 +16,7 @@ import (
 
 // MockUser 是 mock 目录中的用户。
 type MockUser struct {
-	Username    string   // sAMAccountName
+	Username    string // sAMAccountName
 	DisplayName string
 	Email       string
 	MemberOf    []string // 组 CN 列表
@@ -26,11 +26,11 @@ type MockUser struct {
 
 // MockServer 是内存 LDAP 服务器（simple bind + 子树搜索）。
 type MockServer struct {
-	Port     int
-	BindDN   string
-	BindPwd  string
-	BaseDN   string
-	Users    []MockUser
+	Port    int
+	BindDN  string
+	BindPwd string
+	BaseDN  string
+	Users   []MockUser
 
 	ln    net.Listener
 	mu    sync.Mutex
@@ -248,7 +248,9 @@ func (s *MockServer) writeMsg(nc net.Conn, msgID int, opTag byte, body []byte) e
 
 // ---- 过滤器求值 ----
 
-type filter interface{ match(attrs map[string][]string) bool }
+type filter interface {
+	match(attrs map[string][]string) bool
+}
 
 type eqFilter struct{ attr, val string }
 

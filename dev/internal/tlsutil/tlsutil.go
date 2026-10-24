@@ -23,16 +23,16 @@ func GenerateSelfSigned(certPath, keyPath string) error {
 	}
 	serial, _ := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
 	tmpl := x509.Certificate{
-		SerialNumber: serial,
-		Subject:      pkix.Name{CommonName: "YuDuan Hub", Organization: []string{"YuDuan"}},
-		NotBefore:    time.Now().Add(-time.Hour),
-		NotAfter:     time.Now().Add(10 * 365 * 24 * time.Hour),
-		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
-		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		SerialNumber:          serial,
+		Subject:               pkix.Name{CommonName: "YuDuan Hub", Organization: []string{"YuDuan"}},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(10 * 365 * 24 * time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		BasicConstraintsValid: true,
-		IsCA:         true,
-		DNSNames:     []string{"localhost"},
-		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("::1")},
+		IsCA:                  true,
+		DNSNames:              []string{"localhost"},
+		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("::1")},
 	}
 	der, err := x509.CreateCertificate(rand.Reader, &tmpl, &tmpl, &priv.PublicKey, priv)
 	if err != nil {

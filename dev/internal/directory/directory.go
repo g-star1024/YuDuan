@@ -108,10 +108,10 @@ type SyncResult struct {
 
 // SyncEngine 执行目录 -> RBAC 的同步。
 type SyncEngine struct {
-	Source   DirectorySource
-	Mapping  RoleMapping
-	Users    auth.UserStore
-	Pepper   string
+	Source  DirectorySource
+	Mapping RoleMapping
+	Users   auth.UserStore
+	Pepper  string
 }
 
 // NewSyncEngine 构造同步引擎。

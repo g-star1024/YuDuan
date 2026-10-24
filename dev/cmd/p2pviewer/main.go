@@ -4,6 +4,7 @@
 // 收取二进制媒体帧：
 //   - p2p：监听媒体端口，接收被控端 dial_direct 直连帧（4B 长度前缀分帧）；
 //   - relay：经中枢 viewer 长连接收取二进制帧中继（P2P 不可达时的兜底路径）。
+//
 // 校验帧格式（magic/version/头字段）与 JPEG SOI，落盘样例帧并输出统计。
 // 用途：CI/联调验证远控媒体运行时，不面向终端用户。
 package main
@@ -182,127 +183,127 @@ func main() {
 					if err := conn.WriteMessage(selB); err != nil {
 						fatal("发送 rc_select 失败: %v", err)
 					}
-				selectSent = true
-				logf("已发送 rc_select（transport=%s codec=%d media=%s）", *transport, *codec, addr)
-				// ICE-lite：广播本机候选地址（被控端首跳失败时逐个尝试直连升级）。
-				if *transport == "p2p" && *candidates {
-					sendCandidates(conn, sessionID, ln)
-				}
-				// §8.3.9 带宽自适应闭环：反馈目标帧率（被控端逐轮应用，会话中途升降生效）。
-				// 首条立即发送（等 2s 的话低速用例收满前反馈根本到不了），此后每 2s 一次。
-				if *qos > 0 {
-					go func() {
-						for i := 0; ; i++ {
-							if i > 0 {
-								time.Sleep(2 * time.Second)
+					selectSent = true
+					logf("已发送 rc_select（transport=%s codec=%d media=%s）", *transport, *codec, addr)
+					// ICE-lite：广播本机候选地址（被控端首跳失败时逐个尝试直连升级）。
+					if *transport == "p2p" && *candidates {
+						sendCandidates(conn, sessionID, ln)
+					}
+					// §8.3.9 带宽自适应闭环：反馈目标帧率（被控端逐轮应用，会话中途升降生效）。
+					// 首条立即发送（等 2s 的话低速用例收满前反馈根本到不了），此后每 2s 一次。
+					if *qos > 0 {
+						go func() {
+							for i := 0; ; i++ {
+								if i > 0 {
+									time.Sleep(2 * time.Second)
+								}
+								q, err := proto.NewEnvelope(proto.TypeRCQos, 0, proto.RCQosPayload{
+									SessionID: sessionID, FPS: *qos, Reason: "p2pviewer-feedback",
+								})
+								if err != nil {
+									return
+								}
+								qB, _ := json.Marshal(q)
+								if err := conn.WriteMessage(qB); err != nil {
+									return
+								}
+								logf("已发送 rc_qos fps=%d", *qos)
 							}
-							q, err := proto.NewEnvelope(proto.TypeRCQos, 0, proto.RCQosPayload{
-								SessionID: sessionID, FPS: *qos, Reason: "p2pviewer-feedback",
-							})
-							if err != nil {
-								return
+						}()
+					}
+					// §8.3.11 传输级自适应：周期 RTT 探测；RTT>80ms 时按档位反馈帧率上限，
+					// 让被控端在不依赖渲染统计的情况下感知网络拥塞。
+					if *probe {
+						go func() {
+							for {
+								time.Sleep(1 * time.Second)
+								p, err := proto.NewEnvelope(proto.TypeRCPing, 0, proto.RCPingPayload{
+									SessionID: sessionID, T0: time.Now().UnixMilli(),
+								})
+								if err != nil {
+									return
+								}
+								pB, _ := json.Marshal(p)
+								if err := conn.WriteMessage(pB); err != nil {
+									return
+								}
 							}
-							qB, _ := json.Marshal(q)
-							if err := conn.WriteMessage(qB); err != nil {
-								return
-							}
-							logf("已发送 rc_qos fps=%d", *qos)
-						}
-					}()
-				}
-				// §8.3.11 传输级自适应：周期 RTT 探测；RTT>80ms 时按档位反馈帧率上限，
-				// 让被控端在不依赖渲染统计的情况下感知网络拥塞。
-				if *probe {
-					go func() {
-						for {
-							time.Sleep(1 * time.Second)
-							p, err := proto.NewEnvelope(proto.TypeRCPing, 0, proto.RCPingPayload{
-								SessionID: sessionID, T0: time.Now().UnixMilli(),
-							})
-							if err != nil {
-								return
-							}
-							pB, _ := json.Marshal(p)
-							if err := conn.WriteMessage(pB); err != nil {
-								return
-							}
-						}
-					}()
-				}
-				}
-		case proto.TypeRCPong:
-			var p proto.RCPingPayload
-			_ = env.DecodePayload(&p)
-			rtt := time.Now().UnixMilli() - p.T0
-			logf("RTT 探测: %d ms", rtt)
-			// RTT 越过档位（>80ms）→ 立即反馈一次上限（副端 min(目标, 档位) 生效）
-			if *probe && rtt > 80 && time.Since(lastQosByRtt) > 2*time.Second {
-				cap := 15
-				if rtt > 400 {
-					cap = 4
-				} else if rtt > 200 {
-					cap = 8
-				}
-				q, err := proto.NewEnvelope(proto.TypeRCQos, 0, proto.RCQosPayload{
-					SessionID: sessionID, FPS: cap, Reason: "rtt_probe", RTTMs: rtt,
-				})
-				if err == nil {
-					qB, _ := json.Marshal(q)
-					if err := conn.WriteMessage(qB); err == nil {
-						logf("已发送 rc_qos（RTT %dms → 上限 %dfps）", rtt, cap)
-						lastQosByRtt = time.Now()
+						}()
 					}
 				}
-			}
-		case proto.TypeRCEvent:
-			var p proto.RCEventPayload
-			_ = env.DecodePayload(&p)
-			logf("事件[%s]: %s", p.Kind, p.Message)
-			if p.Kind == "error" {
-				fatal("被控端报错: %s", p.Message)
-			}
-			// 被控端可能诚实回退编解码器（如选 h265 但无原生库 → jpeg）：
-			// 从 media_selected 事件末尾的 codec 名采纳实际值，避免误判有效帧。
-			if p.Kind == "media_selected" && !codecAdopted {
-				if name := lastToken(p.Message); name != "" {
-					for i, n := range codecNames {
-						if n == name {
-							*codec = i
-							codecAdopted = true
-							logf("采纳被控端实际编解码器: %s", name)
-							break
+			case proto.TypeRCPong:
+				var p proto.RCPingPayload
+				_ = env.DecodePayload(&p)
+				rtt := time.Now().UnixMilli() - p.T0
+				logf("RTT 探测: %d ms", rtt)
+				// RTT 越过档位（>80ms）→ 立即反馈一次上限（副端 min(目标, 档位) 生效）
+				if *probe && rtt > 80 && time.Since(lastQosByRtt) > 2*time.Second {
+					cap := 15
+					if rtt > 400 {
+						cap = 4
+					} else if rtt > 200 {
+						cap = 8
+					}
+					q, err := proto.NewEnvelope(proto.TypeRCQos, 0, proto.RCQosPayload{
+						SessionID: sessionID, FPS: cap, Reason: "rtt_probe", RTTMs: rtt,
+					})
+					if err == nil {
+						qB, _ := json.Marshal(q)
+						if err := conn.WriteMessage(qB); err == nil {
+							logf("已发送 rc_qos（RTT %dms → 上限 %dfps）", rtt, cap)
+							lastQosByRtt = time.Now()
 						}
 					}
 				}
-			}
+			case proto.TypeRCEvent:
+				var p proto.RCEventPayload
+				_ = env.DecodePayload(&p)
+				logf("事件[%s]: %s", p.Kind, p.Message)
+				if p.Kind == "error" {
+					fatal("被控端报错: %s", p.Message)
+				}
+				// 被控端可能诚实回退编解码器（如选 h265 但无原生库 → jpeg）：
+				// 从 media_selected 事件末尾的 codec 名采纳实际值，避免误判有效帧。
+				if p.Kind == "media_selected" && !codecAdopted {
+					if name := lastToken(p.Message); name != "" {
+						for i, n := range codecNames {
+							if n == name {
+								*codec = i
+								codecAdopted = true
+								logf("采纳被控端实际编解码器: %s", name)
+								break
+							}
+						}
+					}
+				}
 			case proto.TypeRCStop:
 				fatal("会话被结束（仅 %d/%d 帧）", got, *frames)
 			}
-	case frame, ok := <-frameCh:
-		if !ok {
-			fatal("帧通道关闭（仅 %d/%d 帧）", got, *frames)
-		}
-		codecGot, fw, fh, payload, err := checkFrame(frame, *codec)
-		if err != nil {
-			logf("丢弃无效帧: %v", err)
-			continue
-		}
-		if got == 0 {
-			started = time.Now()
-			logf("首帧头 8 字节: % x（%s 帧用于校验编码器输出特征）", payload[:min(8, len(payload))], codecName(codecGot))
-			// 首帧 = 关键帧：H.264 首段应为 SPS(7)，HEVC 应为 VPS(32)
-			if int(codecGot) == codecH264 || int(codecGot) == codecH265 {
-				if err := checkAnnexB(payload, codecGot); err != nil {
-					fatal("首帧 Annex-B/参数集校验失败: %v", err)
-				}
-				logf("首帧 Annex-B 校验通过（起始码 + 参数集在位）")
+		case frame, ok := <-frameCh:
+			if !ok {
+				fatal("帧通道关闭（仅 %d/%d 帧）", got, *frames)
 			}
+			codecGot, fw, fh, payload, err := checkFrame(frame, *codec)
+			if err != nil {
+				logf("丢弃无效帧: %v", err)
+				continue
+			}
+			if got == 0 {
+				started = time.Now()
+				logf("首帧头 8 字节: % x（%s 帧用于校验编码器输出特征）", payload[:min(8, len(payload))], codecName(codecGot))
+				// 首帧 = 关键帧：H.264 首段应为 SPS(7)，HEVC 应为 VPS(32)
+				if int(codecGot) == codecH264 || int(codecGot) == codecH265 {
+					if err := checkAnnexB(payload, codecGot); err != nil {
+						fatal("首帧 Annex-B/参数集校验失败: %v", err)
+					}
+					logf("首帧 Annex-B 校验通过（起始码 + 参数集在位）")
+				}
+			}
+			got++
+			totalBytes += len(payload)
+			saved := saveFrame(*out, got, codecGot, payload)
+			logf("帧 #%d ok: codec=%s %dx%d %d 字节载荷 → %s", got, codecName(codecGot), fw, fh, len(payload), saved)
 		}
-		got++
-		totalBytes += len(payload)
-		saved := saveFrame(*out, got, codecGot, payload)
-		logf("帧 #%d ok: codec=%s %dx%d %d 字节载荷 → %s", got, codecName(codecGot), fw, fh, len(payload), saved)
-	}
 	}
 
 	elapsed := time.Since(started)
@@ -364,6 +365,7 @@ func checkFrame(b []byte, wantCodec int) (byte, int, int, []byte, error) {
 // sendCandidates 广播 ICE-lite 候选：
 //   - 监听绑定具体 IP（如 127.0.0.1）→ 唯一候选即该地址（拨别的地址必然被拒）；
 //   - 监听绑定通配地址（0.0.0.0 / ::）→ 枚举本机非回送网卡 IPv4 + 监听端口。
+//
 // 先发 rc_offer（批量），再逐个 rc_candidate（增量，与协议 §8.3 一致）。
 func sendCandidates(conn *ws.Conn, sessionID string, ln net.Listener) {
 	host, port, err := net.SplitHostPort(ln.Addr().String())

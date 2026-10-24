@@ -105,9 +105,9 @@ type CommandPayload struct {
 
 // RCRequestPayload —— 请求开启远控会话。Operator 为管理员标识（审计用）。
 type RCRequestPayload struct {
-	DeviceID string `json:"device_id"`
+	DeviceID  string `json:"device_id"`
 	SessionID string `json:"session_id"`
-	Operator string  `json:"operator"`
+	Operator  string `json:"operator"`
 }
 
 // RCReadyPayload —— 被控端捕获就绪。
@@ -162,7 +162,7 @@ type RCCapabilitiesPayload struct {
 type RCSelectPayload struct {
 	SessionID string `json:"session_id"`
 	Codec     int    `json:"codec"`
-	Transport string `json:"transport"` // "p2p" 直连 / "relay" 中枢中继
+	Transport string `json:"transport"`            // "p2p" 直连 / "relay" 中枢中继
 	MediaAddr string `json:"media_addr,omitempty"` // P2P 直连地址（transport=p2p 时）
 }
 
@@ -180,8 +180,8 @@ type RCAnswerPayload struct {
 
 // RCCandidatePayload —— 追加候选地址（ICE-lite 风格，逐个增量上报）。
 type RCCandidatePayload struct {
-	SessionID string   `json:"session_id"`
-	Candidate string   `json:"candidate"`
+	SessionID string `json:"session_id"`
+	Candidate string `json:"candidate"`
 }
 
 // RCQosPayload —— Viewer→Hub→Agent 的服务质量反馈（§8.3.9 带宽自适应闭环）：

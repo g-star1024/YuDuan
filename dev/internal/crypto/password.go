@@ -23,9 +23,9 @@ import (
 // 与登录时透明升级能力，新口令一律按 argon2id 落库。
 
 const (
-	pwArgon2Time   = 3       // 迭代次数
+	pwArgon2Time   = 3         // 迭代次数
 	pwArgon2MemKiB = 64 * 1024 // 64 MiB 内存（OWASP 推荐量级）
-	pwArgon2Par    = 4       // 并行度
+	pwArgon2Par    = 4         // 并行度
 	pwSaltLen      = 16
 	pwTagLen       = 32
 	pwArgon2Ver    = 19

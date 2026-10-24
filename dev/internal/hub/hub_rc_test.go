@@ -291,9 +291,9 @@ func proto_codecJPEG() int { return 1 }
 // readTypedWithTimeout 在 d 内读取一条消息并返回（载荷, 是否二进制）；超时返回错误。
 func readTypedWithTimeout(c *ws.Conn, d time.Duration) ([]byte, bool, error) {
 	type res struct {
-		data    []byte
+		data     []byte
 		isBinary bool
-		err     error
+		err      error
 	}
 	ch := make(chan res, 1)
 	go func() {

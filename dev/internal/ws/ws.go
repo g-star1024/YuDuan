@@ -22,10 +22,10 @@ const guid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 // Conn 表示一个 WebSocket 连接；isClient 决定写帧是否加掩码、读帧是否要求掩码。
 type Conn struct {
-	conn    net.Conn
-	buf     *bufio.Reader
+	conn     net.Conn
+	buf      *bufio.Reader
 	isClient bool
-	wmu     sync.Mutex // 写锁：远控中继需多 goroutine 并发写同一连接
+	wmu      sync.Mutex // 写锁：远控中继需多 goroutine 并发写同一连接
 }
 
 // Upgrade 在服务端将 HTTP 连接升级为 WebSocket（HTTP Hijack 实现）。

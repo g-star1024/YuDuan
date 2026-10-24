@@ -330,7 +330,7 @@ const userCols = `username,display_name,role,password,disabled,must_change_pw,so
 func rowToUser(r []string) auth.User {
 	return auth.User{
 		Username: r[0], DisplayName: r[1], Role: r[2], Password: r[3],
-		Disabled: r[4] == "t" || r[4] == "true",
+		Disabled:     r[4] == "t" || r[4] == "true",
 		MustChangePW: r[5] == "t" || r[5] == "true",
 		Source:       r[6],
 	}

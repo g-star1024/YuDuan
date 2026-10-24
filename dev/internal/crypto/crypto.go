@@ -1,6 +1,7 @@
 // Package crypto 提供御端安全基座所需的零依赖密码学原语：
 //   - 指令 HMAC-SHA256 签名/验签（铁律 4：关键指令服务端签名、副端验签）
 //   - 登录会话令牌的签发与校验（HMAC 绑定 username/role/exp）
+//
 // 仅依赖 Go 标准库，避免在受限环境拉取第三方依赖。
 package crypto
 

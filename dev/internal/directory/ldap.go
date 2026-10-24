@@ -52,9 +52,9 @@ func (l *LDAPDirectory) ListUsers() ([]DirUser, error) {
 		base = l.cfg.BaseDN
 	}
 	entries, err := conn.Search(ldap.SearchRequest{
-		BaseDN: base,
-		Scope:  ldap.ScopeWholeSubtree,
-		Filter: "(&(objectClass=user)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))",
+		BaseDN:     base,
+		Scope:      ldap.ScopeWholeSubtree,
+		Filter:     "(&(objectClass=user)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))",
 		Attributes: []string{"sAMAccountName", "displayName", "mail", "memberOf"},
 	})
 	if err != nil {

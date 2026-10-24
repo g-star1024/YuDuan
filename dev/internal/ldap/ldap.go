@@ -26,12 +26,12 @@ const (
 
 // 结果码子集（RFC 4511 A.1）
 const (
-	ResultSuccess           = 0
-	ResultOperationsError   = 1
-	ResultNoSuchObject      = 32
-	ResultInvalidDNSyntax   = 34
+	ResultSuccess            = 0
+	ResultOperationsError    = 1
+	ResultNoSuchObject       = 32
+	ResultInvalidDNSyntax    = 34
 	ResultInvalidCredentials = 49
-	ResultUnavailable       = 52
+	ResultUnavailable        = 52
 )
 
 // Entry 是一条目录条目。
@@ -183,8 +183,8 @@ func (c *Conn) Search(req SearchRequest) ([]Entry, error) {
 
 // ---- BER 编解码 ----
 
-func encodeInt(n int) []byte  { return tlv(0x02, intContent(n)) }
-func encodeEnum(n int) []byte { return tlv(0x0A, intContent(n)) }
+func encodeInt(n int) []byte    { return tlv(0x02, intContent(n)) }
+func encodeEnum(n int) []byte   { return tlv(0x0A, intContent(n)) }
 func encodeStr(s string) []byte { return tlv(0x04, []byte(s)) }
 func encodeBool(b bool) []byte {
 	if b {
@@ -456,11 +456,11 @@ func encodeFilter(f string) ([]byte, error) {
 		//   matchingRule [1] OPTIONAL, type [2] OPTIONAL,
 		//   matchValue [3], dnAttributes [4] DEFAULT FALSE }
 		// 上下文标签直接承载字节（不再套 OCTET STRING TLV）。
-		em := tlv(0x81, []byte(rule))              // [1] matchingRule
+		em := tlv(0x81, []byte(rule))                   // [1] matchingRule
 		em = append(em, tlv(0x82, []byte(attrName))...) // [2] type
 		em = append(em, tlv(0x83, []byte(val))...)      // [3] matchValue
 		em = append(em, tlv(0x84, []byte{0x00})...)     // [4] dnAttributes = FALSE
-		return tlv(0xA9, em), nil // [9] extensibleMatch
+		return tlv(0xA9, em), nil                       // [9] extensibleMatch
 	}
 	// 简单形式：attr=value / attr=*
 	eq := strings.Index(inner, "=")

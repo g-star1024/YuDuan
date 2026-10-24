@@ -2,7 +2,6 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-
 package blake2b
 
 func hashBlocks(h *[8]uint64, c *[2]uint64, flag uint64, blocks []byte) {
