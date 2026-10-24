@@ -8,8 +8,10 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"yuduan/internal/audit"
 	"yuduan/internal/auth"
@@ -85,7 +87,7 @@ func main() {
 		RepoDir: repoDir, Store: st, Auditor: aud, Users: us,
 		Auth: authSvc, HMACSecret: secret, HMACEnforce: enforce, DirSync: dirSync,
 		HubID: os.Getenv("YUDUAN_HUB_ID"), PublicAddr: envOr("YUDUAN_PUBLIC_ADDR", plainBound),
-		SignSeed: signSeed,
+		SignSeed:            signSeed,
 		RecordEnabled:       recordEnabled,
 		RecordDir:           envOr("YUDUAN_RECORD_DIR", "data/recordings"),
 		RecordRetentionDays: recordRetention,
@@ -113,20 +115,51 @@ func main() {
 
 	go h.StartReaper()
 
-	// TLS 监听：未设置该变量时默认 :8443；显式设为空串 = 关闭 TLS（多实例测试/纯内网明文部署）
+	// TLS 证书：优先私有 CA 模式（certs/ca.pem 存在 → 自动签发/续签服务器证书，
+	// 见 dev/cmd/ca）；无 CA 时退回一次性自签（开发态）。显式 YUDUAN_TLS_CERT/KEY 优先。
 	tlsAddr := os.Getenv("YUDUAN_TLS_ADDR")
 	if _, ok := os.LookupEnv("YUDUAN_TLS_ADDR"); !ok {
 		tlsAddr = ":8443"
 	}
 	cert := envOr("YUDUAN_TLS_CERT", "certs/cert.pem")
 	key := envOr("YUDUAN_TLS_KEY", "certs/key.pem")
+	caFile := envOr("YUDUAN_CA_CERT", "certs/ca.pem")
 
-	if _, err := os.Stat(cert); err != nil {
-		if err := tlsutil.GenerateSelfSigned(cert, key); err == nil {
-			log.Printf("[hub] 已生成自签证书: %s", cert)
-		} else {
-			log.Printf("[hub] 生成证书失败，仅启动明文监听: %v", err)
-			tlsAddr = ""
+	if os.Getenv("YUDUAN_TLS_CERT") == "" {
+		if _, err := os.Stat(caFile); err == nil {
+			// 私有 CA 模式：优先完整链文件（chain.pem = leaf+root，pin 模式临时
+			// CAfile 需要根锚）；无链文件退回叶证书（副端需 YUDUAN_TLS_CAFILE=ca.pem）。
+			// 私钥同步取 CA 目录（YUDUAN_TLS_KEY 显式指定时不覆盖）。
+			caDir := filepath.Dir(caFile)
+			if st, err := os.Stat(filepath.Join(caDir, "chain.pem")); err == nil && !st.IsDir() {
+				cert = filepath.Join(caDir, "chain.pem")
+			}
+			if os.Getenv("YUDUAN_TLS_KEY") == "" {
+				key = filepath.Join(caDir, "key.pem")
+			}
+			// 服务器证书缺失时自动签发（SAN 补充本机主机名）；
+			// 已存在则沿用（轮换用 dev/cmd/ca issue-server）。启动时到期告警。
+			host, _ := os.Hostname()
+			if _, err := os.Stat(cert); err != nil {
+				if err := tlsutil.IssueServerCert(caFile, envOr("YUDUAN_CA_KEY", "certs/ca.key"),
+					cert, key, []string{host}, nil); err != nil {
+					log.Printf("[hub] 从私有 CA 签发服务器证书失败: %v", err)
+				} else {
+					log.Printf("[hub] 已从私有 CA（%s）签发服务器证书 %s", caFile, cert)
+				}
+			}
+			if na, err := tlsutil.LoadCertNotAfter(cert); err == nil {
+				if days := int(time.Until(na).Hours() / 24); days < 30 {
+					log.Printf("[hub] ⚠️ 服务器证书 %d 天后到期（%s），请运行 ca issue-server 轮换", days, na.Format("2006-01-02"))
+				}
+			}
+		} else if _, err := os.Stat(cert); err != nil {
+			if err := tlsutil.GenerateSelfSigned(cert, key); err == nil {
+				log.Printf("[hub] 无私有 CA（certs/ca.pem），已生成一次性自签证书: %s（生产请用 dev/cmd/ca 建立根 CA）", cert)
+			} else {
+				log.Printf("[hub] 生成证书失败，仅启动明文监听: %v", err)
+				tlsAddr = ""
+			}
 		}
 	}
 	if tlsAddr != "" {

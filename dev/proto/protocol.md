@@ -286,3 +286,13 @@
 - **流程**：中继首帧懒开文件（失败仅记一次日志，不阻断会话）；endSession 落盘 + 审计 `rc_record_saved`；Janitor 每小时按 mtime 清理过期文件。回放 `record.ReadAll(path, master)` 逐帧还原，密钥错误/篡改即 GCM 校验失败。
 - **API**：`GET /api/v1/recordings`（PermAuditView）列出 `{name,bytes,modified}`（不含内容）。
 - **边界**：仅中继（relay）路径录像——P2P 直连帧不经中枢，属设计预期（P2P 模式如需录像须副端/主端本地实现，待产品决策）。
+
+### 8.3.13 私有 CA 与 TLS 信任锚（2026-10-24 落地，§5 收口）
+
+内网部署的「真实 CA」= 企业自建根 CA（零成本、自主掌控；Let's Encrypt 需公网域名，商业证书签不了内网名，均不适用）：
+
+- **工具**：`dev/cmd/ca`（纯 std）——`init`（根 CA + 服务器证书，幂等不覆盖已有根）、`issue-server`（轮换，1 年）、`issue-client`（副端 mTLS 客户端证书，CN=设备 ID 供审计对账）、`pin`（输出叶证书 SPKI SHA-256，与副端 `YUDUAN_TLS_PIN` 同口径）、`check`（到期检查，<30 天退出码 1 供 cron 告警）。
+- **目录布局**：`ca.pem`/`ca.key`（根，离线保管）+ `cert.pem`/`key.pem`（叶，1 年）+ `chain.pem`（leaf+root 全链，供中枢下发）+ `client-<id>.pem/.key`。
+- **中枢**：`certs/ca.pem` 存在即自动 CA 模式（证书缺失自动签发、SAN 补本机主机名、启动到期告警、优先下发 chain.pem 全链）；无 CA 退回一次性自签（开发态）。ECDSA P-256，根 10 年 / 叶 1 年，根 MaxPathLen=0（扁平链）。
+- **副端**（rust/agent/src/tls.rs 修订）：pin 模式抓取**完整证书链**，按**叶证书**（链首）校验 SPKI，临时 CAfile 用整条链——修复了「叶证书当锚」在 CA 签发形态下链验证失败的问题（自签形态不受影响）。
+- **实测**（macOS，hub TLS :9443 / mTLS :9444）：① PIN 模式（CA 签发 + 全链）注册成功；② CAFILE 链式严格校验注册成功；③ 错误 pin 正确拒绝（SPKI 不匹配提示）；④ mTLS 强制客户端证书 + pin 双因子注册成功。

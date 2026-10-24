@@ -31,7 +31,7 @@ dev/
 │   ├── audit/              # 审计事件与 Auditor 接口
 │   ├── directory/          # AD/LDAP 目录同步引擎（File/LDAP 两种源）
 │   ├── pg/                 # 零依赖 PostgreSQL v3 客户端
-│   ├── tlsutil/            # 自签证书生成（stdlib）
+│   ├── tlsutil/            # 证书：私有 CA（根/服务器/客户端签发 + SPKI pin）+ 自签兜底
 │   └── hub/                # 中枢：长连接纳管 / RBAC REST / 指令签名下发 / 报表 / 远控中继 / 软件仓库 / 审计 / 目录同步
 ├── cmd/
 │   ├── hub/                # 中枢入口（env 配置存储/安全/目录同步/TLS）
@@ -53,7 +53,11 @@ dev/
 ├── e2e_pg.py               # PostgreSQL + 多中枢总线端到端验证（17 项：连接池/参数化/去粘性/WORM 触发器/持久化）
 ├── e2e_vt_encoder.py       # 真实原生编码器端到端验证（10 项：h264/h265 真码流 + P 帧 + ffmpeg 零错误解码 + QoS 限帧）
 ├── encoder-vt/             # macOS VideoToolbox 原生编码器动态库 + 直测 fixture（见 encoder-vt/README.md）
+├── encoder-vaapi/          # Linux VAAPI 原生编码器库（§8.3.13；离线语法自检 + 目标机构建脚本）
+├── encoder-mf/             # Windows Media Foundation 原生编码器库（§8.3.13；同上）
 ├── fixtures/               # 编码器验证桩（yuduan_enc_stub.c，§8.3.4 契约形状）
+├── cmd/ca/                 # 私有 CA 管理工具（init / issue-server / issue-client / pin / check）
+├── cmd/recreplay/          # 加密录像回放工具（.yrec 解密导出 + ffmpeg 外部校验）
 ├── proto/                  # M1 冻结：通信协议 + 数据库 Schema
 ├── agent/INTERFACES.md     # M1 冻结：副端跨平台接口契约
 ├── hub/README.md           # 中枢说明
@@ -131,3 +135,34 @@ YUDUAN_HUB=ws://127.0.0.1:8080/ws/agent ./target/agent
 - **远控画质**：MVP 用 JPEG base64 中枢中继；生产演进为 P2P 直连 + H.264/H.265 二进制帧（protocol.md §4/§5/§8）。
 
 详见根目录《终端统一管理平台-技术开发文档.md》《开发计划与排期.md》与 `dev/HA.md`。
+
+## 私有 CA（内网 TLS 信任锚，§5）
+
+内网部署推荐自建根 CA（零成本、企业自主掌控，替代一次性自签）：
+
+```bash
+cd dev
+go build -o bin/ca ./cmd/ca
+
+# 1) 建根 CA + 签发中枢服务器证书（SAN：localhost/127.0.0.1 + -dns/-ip 补充内网名/IP）
+./bin/ca init -dir certs -dns hub.office.local -ip 10.0.0.5
+
+# 2) 启动中枢：检测到 certs/ca.pem 自动走 CA 模式（缺证书自动签发 + 到期告警，优先下发 chain.pem 全链）
+./bin/hub
+
+# 3) 副端接入（二选一，推荐 PIN）：
+#    公钥固定（RFC 7469 SPKI）：YUDUAN_TLS_PIN=$(./bin/ca pin -cert certs/cert.pem)
+#    链式严格校验：YUDUAN_TLS_CAFILE=/path/to/certs/ca.pem
+# 4) mTLS 设备通道（可选）：YUDUAN_CLIENT_CA=certs/ca.pem 时中枢开 :8444 强制客户端证书
+./bin/ca issue-client -dir certs -cn <设备ID>
+# 副端追加：YUDUAN_CLIENT_CERT=certs/client-<id>.pem YUDUAN_CLIENT_KEY=certs/client-<id>.key
+
+# 5) 运维：到期检查（<30 天退出码 1，可挂 cron 告警）；轮换服务器证书（1 年有效）
+./bin/ca check -dir certs
+./bin/ca issue-server -dir certs -dns hub.office.local -ip 10.0.0.5
+```
+
+要点：`ca.key` 离线保管（仅签发用，不落生产机）；根 CA 有效期 10 年、叶证书 1 年；
+`GenerateRootCA` 幂等（绝不覆盖已有根，覆盖=全网信任重置）；pin 口径与副端
+`rust/agent/src/tls.rs` 一致（SHA256(SPKI DER) hex 小写）。端到端实测见
+`.workbuddy/memory/2026-10-24.md`（pin/CAFILE/错 pin 拒绝/mTLS 四场景）。

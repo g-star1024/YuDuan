@@ -9,9 +9,11 @@
 
 use std::process::Command;
 
-/// 抓取服务端叶子证书 PEM（s_client -showcerts 的第一条 CERTIFICATE 块）。
-/// openssl 不可用时返回 None（调用方据此拒绝连接，安全失败）。
-pub fn fetch_leaf_cert_pem(addr: &str, sni: &str) -> Option<String> {
+/// 抓取服务端下发的**完整证书链** PEM（s_client -showcerts 全部 CERTIFICATE 块按序拼接，
+/// 首张为叶证书）。openssl 不可用时返回 None（调用方据此拒绝连接，安全失败）。
+/// 私有 CA 模式下中枢应下发 leaf+root 全链：完整链才能同时满足
+/// 「叶证书当 pin 锚」与「链式校验需要根锚」两种临时 CAfile 用法。
+pub fn fetch_chain_pem(addr: &str, sni: &str) -> Option<String> {
     let out = Command::new("openssl")
         .args(["s_client", "-connect", addr, "-servername", sni, "-showcerts"])
         .stdin(std::process::Stdio::null())
@@ -20,7 +22,12 @@ pub fn fetch_leaf_cert_pem(addr: &str, sni: &str) -> Option<String> {
         .output()
         .ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
-    extract_first_cert(&text)
+    extract_chain(&text)
+}
+
+/// 抓取服务端叶子证书 PEM（兼容保留：取链首张）。
+pub fn fetch_leaf_cert_pem(addr: &str, sni: &str) -> Option<String> {
+    fetch_chain_pem(addr, sni)
 }
 
 /// 从 openssl 输出中提取第一个 BEGIN/END CERTIFICATE 块。
@@ -29,6 +36,27 @@ fn extract_first_cert(text: &str) -> Option<String> {
     let end_marker = "-----END CERTIFICATE-----";
     let end = text[begin..].find(end_marker)? + begin + end_marker.len();
     Some(text[begin..end].to_string())
+}
+
+/// 从 openssl 输出中提取全部 CERTIFICATE 块（保持服务端下发顺序，叶在前）。
+fn extract_chain(text: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(begin) = rest.find("-----BEGIN CERTIFICATE-----") {
+        let end_marker = "-----END CERTIFICATE-----";
+        let end = match rest[begin..].find(end_marker) {
+            Some(e) => begin + e + end_marker.len(),
+            None => break,
+        };
+        out.push_str(&rest[begin..end]);
+        out.push('\n');
+        rest = &rest[end..];
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
 }
 
 /// 计算证书 PEM 的 SPKI SHA-256（hex）。用于公钥固定。
@@ -67,17 +95,19 @@ fn parse_openssl_sha256(text: &str) -> Option<String> {
     None
 }
 
-/// 校验服务端证书固定：抓取并比对 SPKI；匹配则返回该证书 PEM（供调用方作 CAfile）。
+/// 校验服务端证书固定：抓取完整链，比对**叶证书**（链首）SPKI；匹配则返回
+/// 完整链 PEM（供调用方作临时 CAfile——链含根锚，CA 签发与自签两种形态都可通过）。
 /// 任一环节失败或不匹配均返回 None（调用方应拒绝连接）。
 pub fn verify_server_pin(addr: &str, sni: &str, pin: &str) -> Option<String> {
     let pin = pin.trim().to_ascii_lowercase();
     if pin.is_empty() {
         return None;
     }
-    let pem = fetch_leaf_cert_pem(addr, sni)?;
-    let spki = spki_sha256_hex(&pem)?;
+    let chain = fetch_chain_pem(addr, sni)?;
+    let leaf = extract_first_cert(&chain)?;
+    let spki = spki_sha256_hex(&leaf)?;
     if spki == pin {
-        Some(pem)
+        Some(chain)
     } else {
         eprintln!(
             "[agent] TLS 证书固定失败：SPKI 不匹配（期望 {} 实际 {}）",
