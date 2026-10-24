@@ -45,6 +45,30 @@ mod sha256;
 mod swdist;
 mod tamper;
 mod tls;
+// Windows 原生资产采集（实机版见 src/win_asset.rs / src/win_net.rs）。
+// 非 Windows 平台提供同名桩，保证三平台均可编译；调用点都在 cfg!(windows)
+// 运行时分支内，桩永远不会被真实执行（仅编译期占位）。
+#[cfg(windows)]
+mod win_asset;
+#[cfg(not(windows))]
+mod win_asset {
+    pub fn win_os_version() -> String { String::new() }
+    pub fn win_cpu() -> String { String::new() }
+    pub fn win_serial_no() -> String { String::new() }
+    pub fn win_memory_gb_() -> i64 { 0 }
+    pub fn win_disk_gb_() -> i64 { 0 }
+}
+#[cfg(windows)]
+mod win_net;
+#[cfg(not(windows))]
+mod win_net {
+    pub fn decode_console_bytes(bytes: &[u8]) -> String {
+        String::from_utf8_lossy(bytes).into_owned()
+    }
+    pub fn win_ip_mac_pair() -> (String, String) { (String::new(), String::new()) }
+    pub fn win_mac_addr() -> String { String::new() }
+    pub fn win_outbound_ip() -> String { String::new() }
+}
 
 // ===================== 极简 JSON 解析（无 serde，纯 std） =====================
 
@@ -437,6 +461,30 @@ fn run_output(cmd: &str, args: &[&str]) -> String {
         .unwrap_or_default()
 }
 
+/// run_output_gbk 读取以系统 ANSI 代码页编码输出的 Windows 命令（如中文版 ipconfig）。
+/// 中文系统下 ipconfig 输出为 CP936(GBK)，用 UTF-8 解码会得到乱码，
+/// 导致按值/标签解析全部失效。交由系统 MultiByteToWideChar 转换最稳妥。
+fn run_output_gbk(cmd: &str, args: &[&str]) -> String {
+    Command::new(cmd)
+        .args(args)
+        .output()
+        .map(|o| {
+            let mut s = String::new();
+            #[cfg(windows)]
+            {
+                s.push_str(&crate::win_net::decode_console_bytes(&o.stdout));
+                s.push_str(&crate::win_net::decode_console_bytes(&o.stderr));
+            }
+            #[cfg(not(windows))]
+            {
+                s.push_str(&String::from_utf8_lossy(&o.stdout));
+                s.push_str(&String::from_utf8_lossy(&o.stderr));
+            }
+            s
+        })
+        .unwrap_or_default()
+}
+
 fn trim(s: &str) -> String {
     s.trim().to_string()
 }
@@ -467,10 +515,21 @@ fn hostname() -> String {
 }
 
 fn os_version() -> String {
+    if cfg!(windows) {
+        // Windows 无 uname；用注册表 Build 号判定（Win11 上 ProductName 恒为 Win10）
+        return win_asset::win_os_version();
+    }
     trim(&run_output("uname", &["-r"]))
 }
 
 fn arch() -> String {
+    if cfg!(windows) {
+        return match std::env::consts::ARCH {
+            "x86_64" => "x86_64".to_string(),
+            "aarch64" => "arm64".to_string(),
+            other => other.to_string(),
+        };
+    }
     trim(&run_output("uname", &["-m"]))
 }
 
@@ -478,9 +537,8 @@ fn cpu() -> String {
     if cfg!(target_os = "macos") {
         trim(&run_output("sysctl", &["-n", "machdep.cpu.brand_string"]))
     } else if cfg!(windows) {
-        // wmic cpu get name -> 第二行
-        let out = run_output("wmic", &["cpu", "get", "name"]);
-        out.lines().nth(1).map(trim).unwrap_or_default()
+        // Windows 11 已移除 wmic；原生注册表优先，wmic 仅作回退
+        win_asset::win_cpu()
     } else {
         // Linux: /proc/cpuinfo 的 model name 首行
         if let Ok(content) = std::fs::read_to_string("/proc/cpuinfo") {
@@ -503,12 +561,8 @@ fn memory_gb() -> i64 {
             .unwrap_or(0.0);
         (bytes / 1e9).round() as i64
     } else if cfg!(windows) {
-        let out = run_output("wmic", &["computersystem", "get", "totalphysicalmemory"]);
-        if let Some(line) = out.lines().nth(1) {
-            let bytes = trim(line).parse::<f64>().unwrap_or(0.0);
-            return (bytes / 1e9).round() as i64;
-        }
-        0
+        // Windows 11 已移除 wmic；原生 GlobalMemoryStatusEx 优先，wmic 仅作回退
+        win_asset::win_memory_gb_()
     } else {
         if let Ok(content) = std::fs::read_to_string("/proc/meminfo") {
             for line in content.lines() {
@@ -528,16 +582,10 @@ fn memory_gb() -> i64 {
 
 fn disk_gb() -> i64 {
     if cfg!(windows) {
-        let out = run_output("wmic", &["logicaldisk", "get", "size"]);
-        let mut total = 0.0;
-        for line in out.lines().skip(1) {
-            let v = trim(line).parse::<f64>().unwrap_or(0.0);
-            if v > 0.0 {
-                total += v;
-            }
-        }
-        (total / 1e9).round() as i64
-    } else {
+        // Windows 11 已移除 wmic；原生 GetDiskFreeSpaceExW 优先，wmic 仅作回退
+        return win_asset::win_disk_gb_();
+    }
+    {
         // df -k / -> 第二行第二列为 1K-blocks
         let out = run_output("df", &["-k", "/"]);
         if let Some(line) = out.lines().nth(1) {
@@ -557,7 +605,8 @@ fn net_info() -> (String, String) {
     let mut ip = String::new();
     let mut mac = String::new();
     let text = if cfg!(windows) {
-        run_output("ipconfig", &["/all"])
+        // 中文系统 ipconfig 输出为 CP936，用 GBK 路径读取
+        run_output_gbk("ipconfig", &["/all"])
     } else if cfg!(target_os = "linux") {
         run_output("ip", &["addr"])
     } else {
@@ -565,7 +614,35 @@ fn net_info() -> (String, String) {
     };
 
     if cfg!(windows) {
+        // 原生 Win32 路径优先：ipconfig 输出随系统语言本地化且为 GBK 编码，
+        // 文本解析在中/英系统上不可靠（见 win_net.rs 注释）。
+        // 优先取「同属一张网卡」的 IP+MAC 配对，避免 IP 与 MAC 来自不同适配器。
+        let (pair_ip, pair_mac) = win_net::win_ip_mac_pair();
+        let native_mac = if pair_mac.is_empty() {
+            win_net::win_mac_addr()
+        } else {
+            pair_mac
+        };
+        let native_ip = if pair_ip.is_empty() {
+            win_net::win_outbound_ip()
+        } else {
+            pair_ip
+        };
+        if !native_mac.is_empty() {
+            mac = native_mac;
+        }
+        if !native_ip.is_empty() {
+            ip = native_ip;
+        }
+        if !mac.is_empty() && !ip.is_empty() {
+            return (ip, mac);
+        }
+        // 原生路径不完整时才回退 ipconfig 文本解析
+    }
+
+    if cfg!(windows) {
         // 简单扫描：IPv4 Address ... : x.x.x.x  /  Physical Address ... : xx-xx-...
+        // 注意：仅在英文系统上有效（中文系统标签为「IPv4 地址」「物理地址」）。
         for line in text.lines() {
             let l = line.trim();
             if ip.is_empty() && l.contains("IPv4 Address") {
@@ -658,8 +735,8 @@ fn serial_no() -> String {
         }
         String::new()
     } else if cfg!(windows) {
-        let out = run_output("wmic", &["bios", "get", "serialnumber"]);
-        out.lines().nth(1).map(trim).unwrap_or_default()
+        // Windows 11 已移除 wmic；BIOS 序列号 → MachineGuid → wmic
+        win_asset::win_serial_no()
     } else {
         // Linux: /sys/class/dmi/id/product_serial（需权限，尽力而为）
         std::fs::read_to_string("/sys/class/dmi/id/product_serial")

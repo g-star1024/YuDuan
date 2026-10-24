@@ -1,4 +1,4 @@
-# 御端（YuDuan）副端 —— Windows 服务安装/卸载脚本（sc.exe 创建系统服务）。
+﻿# 御端（YuDuan）副端 —— Windows 服务安装/卸载脚本（sc.exe 创建系统服务）。
 #
 # 用法（管理员 PowerShell）：
 #   ./deploy/windows/install-agent.ps1               # 安装并启动
@@ -11,7 +11,12 @@
 #       变量写在计算机作用域（Machine），服务重启后生效。
 
 param(
-    [switch]$Uninstall
+    [switch]$Uninstall,
+    # 可选：覆盖脚本顶部的中枢地址/密钥，免改文件即可按现场部署
+    [string]$HubUrl,
+    [string]$Secret,
+    # 可选：原生编码器 DLL 路径（阶段 4 能力依赖；不传则副端诚实回退 RAW_RGBA）
+    [string]$EncoderLib
 )
 
 $ErrorActionPreference = "Stop"
@@ -21,9 +26,9 @@ $DisplayName = "YuDuan Agent"
 $BinDst     = "$env:ProgramFiles\YuDuan\yuduan-agent.exe"
 $LogFile    = "$env:ProgramData\YuDuan\agent.log"
 
-# —— 按现场环境修改 ——
-$HubUrl  = "wss://hub.yuduan.internal:8443/ws/agent"
-$Secret  = "CHANGE-ME-AT-DEPLOY"   # 必须与 Go 中枢 YUDUAN_HMAC_SECRET 一致
+# —— 按现场环境修改（也可用命令行参数覆盖）——
+if (-not $HubUrl) { $HubUrl = "wss://hub.yuduan.internal:8443/ws/agent" }
+if (-not $Secret) { $Secret = "CHANGE-ME-AT-DEPLOY" }   # 必须与 Go 中枢 YUDUAN_HMAC_SECRET 一致
 
 function Test-Admin {
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -38,17 +43,32 @@ if (-not (Test-Admin)) {
 
 if ($Uninstall) {
     Write-Host "==> 停止并移除服务 $ServiceName"
-    sc.exe stop $ServiceName | Out-Null
-    Start-Sleep -Seconds 2
-    sc.exe delete $ServiceName | Out-Null
+    # 停止/删除同样做 sc.exe → cmdlet 回退（受控环境常禁用 sc.exe）
+    try {
+        sc.exe stop $ServiceName | Out-Null
+        Start-Sleep -Seconds 2
+        sc.exe delete $ServiceName | Out-Null
+    } catch {
+        Write-Host "==> sc.exe 不可用，回退 Stop-Service/Remove-Service"
+        Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 2
+        # PS 5.1 无 Remove-Service cmdlet，改用 sc.exe delete 或 WMI
+        try { sc.exe delete $ServiceName | Out-Null } catch {
+            $svcObj = Get-WmiObject -Class Win32_Service -Filter "Name='$ServiceName'" -ErrorAction SilentlyContinue
+            if ($svcObj) { $svcObj.Delete() | Out-Null }
+        }
+    }
     Remove-Item $BinDst -Force -ErrorAction SilentlyContinue
-    [Environment]::SetEnvironmentVariable("YUDUAN_HUB", $null, "Machine")
-    [Environment]::SetEnvironmentVariable("YUDUAN_HMAC_SECRET", $null, "Machine")
+    setx YUDUAN_HUB "" | Out-Null
+    setx YUDUAN_HMAC_SECRET "" | Out-Null
+    setx YUDUAN_ENCODER_LIB "" | Out-Null
     Write-Host "==> 已卸载（日志保留：$LogFile）"
     exit 0
 }
 
-$src = Join-Path $PSScriptRoot "..\target\agent.exe"
+# 二进制位置：本脚本位于 rust/agent/deploy/windows/，因此 target/ 在 rust/agent/target/
+# （即脚本目录上溯三级，而不是两级 —— 原写法 "..\target" 会落到 deploy\target\）
+$src = Join-Path $PSScriptRoot "..\..\target\agent.exe"
 if (-not (Test-Path $src)) {
     Write-Error "未找到 $src，请先构建：rustc -O --target x86_64-pc-windows-msvc src/main.rs -o target/agent.exe"
     exit 1
@@ -59,23 +79,69 @@ New-Item -ItemType Directory -Force -Path (Split-Path $BinDst) | Out-Null
 Copy-Item $src $BinDst -Force
 
 Write-Host "==> 写入环境变量（Machine 作用域，服务重启后生效）"
-[Environment]::SetEnvironmentVariable("YUDUAN_HUB", $HubUrl, "Machine")
-[Environment]::SetEnvironmentVariable("YUDUAN_HMAC_SECRET", $Secret, "Machine")
-
-Write-Host "==> 创建服务（sc.exe，开机自启，失败自动重启）"
-# 注意：sc.exe 的 = 后空格是语法要求
-$create = sc.exe create $ServiceName binPath= "`"$BinDst`"" start= auto DisplayName= "`"$DisplayName`" obj= "LocalSystem"
-if ($LASTEXITCODE -ne 0) {
-    # 已存在则先删后建
-    sc.exe delete $ServiceName | Out-Null
-    Start-Sleep -Seconds 2
-    sc.exe create $ServiceName binPath= "`"$BinDst`"" start= auto DisplayName= "`"$DisplayName`"" obj= "LocalSystem" | Out-Null
+# 用 setx 而非 [Environment]::SetEnvironmentVariable：
+#   后者在某些 Windows 沙箱/受控环境下写 Machine 作用域会直接终止宿主进程
+#   （无异常、无 stderr），导致脚本半途而废。setx 走 setx.exe，可靠且行为一致。
+setx YUDUAN_HUB $HubUrl | Out-Null
+setx YUDUAN_HMAC_SECRET $Secret | Out-Null
+# 原生编码器 DLL（阶段 4 能力依赖）：未指定且默认路径不存在时，副端会诚实回退 RAW_RGBA
+if (-not $EncoderLib) {
+    $EncoderLib = "$env:TEMP\yuduan_enc_mf.dll"
 }
-# 崩溃恢复策略：失败后 5s 重启
-sc.exe failure $ServiceName reset= 86400 actions= restart/5000/restart/5000/restart/5000 | Out-Null
+if (Test-Path $EncoderLib) {
+    setx YUDUAN_ENCODER_LIB $EncoderLib | Out-Null
+    Write-Host "==> 已写入 YUDUAN_ENCODER_LIB=$EncoderLib"
+} else {
+    Write-Host "==> 警告：未找到 MF 编码器 $EncoderLib，副端将诚实回退 RAW_RGBA"
+}
+
+Write-Host "==> 创建服务（开机自启，失败自动重启）"
+# 注意：sc.exe 的 = 后空格是语法要求
+#
+# ⚠️ 路径含空号的引号处理：这里用 ('"' + $Var + '"') 字符串拼接，
+#    不要用反引号转义写法 `"`"$Var`"" —— 该写法在中文 Windows 的
+#    Windows PowerShell 5.1（UTF-8 无 BOM 脚本按 ANSI 读取）下会报
+#    「字符串缺少终止符」，整个脚本无法解析（实机安装阶段 5 时发现）。
+#
+# ⚠️ 创建方式：优先 sc.exe（可写 failure 恢复策略）；
+#    若 sc.exe 被安全策略/受控环境禁用，回退到 PowerShell 原生
+#    New-Service（仍能建服务，只是失败恢复策略需另行设置）。
+$binPathQuoted = '"' + $BinDst + '"'
+$displayQuoted = '"' + $DisplayName + '"'
+$created = $false
+try {
+    $create = sc.exe create $ServiceName binPath= $binPathQuoted start= auto DisplayName= $displayQuoted obj= "LocalSystem"
+    if ($LASTEXITCODE -eq 0) {
+        $created = $true
+        # 崩溃恢复策略：失败后 5s 重启
+        sc.exe failure $ServiceName reset= 86400 actions= restart/5000/restart/5000/restart/5000 | Out-Null
+    }
+} catch {
+    Write-Host "==> sc.exe 不可用（$($_.Exception.Message)），回退 New-Service"
+}
+if (-not $created) {
+    if (Get-Service $ServiceName -ErrorAction SilentlyContinue) {
+        # PS 5.1 无 Remove-Service cmdlet，用 WMI 删
+        $svcObj = Get-WmiObject -Class Win32_Service -Filter "Name='$ServiceName'" -ErrorAction SilentlyContinue
+        if ($svcObj) { $svcObj.Delete() | Out-Null }
+        Start-Sleep -Seconds 2
+    }
+    New-Service -Name $ServiceName -BinaryPathName $binPathQuoted `
+                -DisplayName $DisplayName -StartupType Automatic | Out-Null
+    Write-Host "==> 已用 New-Service 创建（崩溃恢复策略未设置）"
+}
 
 Write-Host "==> 启动服务"
-sc.exe start $ServiceName | Out-Null
-Start-Sleep -Seconds 2
-sc.exe query $ServiceName | Out-Null
-Write-Host "==> 完成。状态：Get-Service $ServiceName；日志：$LogFile（副端 stderr 重定向见 README）"
+try {
+    sc.exe start $ServiceName | Out-Null
+} catch {
+    Start-Service -Name $ServiceName -ErrorAction SilentlyContinue
+}
+Start-Sleep -Seconds 3
+$svc = Get-Service $ServiceName -ErrorAction SilentlyContinue
+if ($svc) {
+    Write-Host ("==> 完成。状态：{0} = {1}（{2}）" -f $svc.Name, $svc.Status, $svc.StartType)
+} else {
+    Write-Host "==> 完成（未查询到服务状态）"
+}
+Write-Host "==> 日志路径：$LogFile（副端 stderr 重定向见 README）"

@@ -9,7 +9,11 @@ MFT，Windows 8+ 无需额外安装；其余 codec `create` 返回 NULL，副端
 | 环节 | 状态 |
 |---|---|
 | 语法/类型（mfstub.h 声明子集 `-fsyntax-only`） | ✅ macOS 开发机可跑（`bash check.sh`） |
-| 运行时编码验证 | ⏳ 待 Windows 实机 |
+| 运行时编码验证 | ✅ **Windows 11 实机通过**（2026-10-24）：harness 直测 60 帧 + 系统 MS H264 解码 MFT 独立实解零错误 + 远控 relay 全链路 60 帧 15.3fps（报告 `dev/verify-windows-report-20261024.md`） |
+
+实机结论要点：MS H264 编码 MFT 固有 12 帧管线延迟（无低延迟旋钮），本库以
+「预置 13 帧黑帧 + 输出队列」吸收；一次性塞多帧会丢帧，须逐帧提交+逐帧拉取；
+扩展导出 `yuduan_enc_flush`（DRAIN 冲刷）。详细出帧模型见 `yuduan_enc_mf.c` 头注释。
 
 实机验证步骤（"x64 Native Tools Command Prompt"）：
 

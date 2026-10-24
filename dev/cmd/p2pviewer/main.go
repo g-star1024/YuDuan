@@ -453,7 +453,12 @@ func lastToken(s string) string {
 }
 
 // checkAnnexB 校验 H.264/H.265 裸流：Annex-B 起始码切分 NAL，逐段非空，
-// 且首 NAL 类型符合关键帧要求（H.264 首段应为 SPS(type 7)；HEVC 应为 VPS(type 32)）。
+// 且首帧内参数集在位（H.264 需含 SPS(7)+PPS(8)；HEVC 需含 VPS(32)+SPS(33)+PPS(34)）。
+//
+// 注意：判据是「参数集在位」而非「首 NAL 必须是 SPS」——不同编码器的首帧形态不同：
+// macOS VideoToolbox 首帧以 SPS 开头，而 Windows Media Foundation 会先输出
+// AUD(9) / SEI(6) 再到 SPS/PPS（见 dev/encoder-mf 实测）。两者都符合
+// dev/encoder-vt/README.md 与 annexb_stat.py 的判据口径，故此处按参数集在位判定。
 func checkAnnexB(p []byte, codec byte) error {
 	if len(p) < 5 {
 		return errors.New("载荷过短")
@@ -471,18 +476,29 @@ func checkAnnexB(p []byte, codec byte) error {
 	prev := sc0
 	for i := sc0; i+2 < len(p); i++ { // 从首起始码之后开始扫（避免把 4 字节起始码内部的 00 00 01 误判为新起始码）
 		if p[i] == 0 && p[i+1] == 0 && p[i+2] == 1 {
+			// 命中 3 字节窗口 00 00 01。若前一字节也是 0，则真实起始码是 4 字节
+			// 形态 00 00 00 01，其**起点在 i-1**（i 只是 00 00 01 的起始位置）。
+			// NAL 载荷起点 = 起始码起点 + 起始码长度，必须按此推算。
+			//
+			// ⚠️ 旧实现按 prev = i + startLen 推算，4 字节形态下多推进了 1 字节，
+			// 使每个 NAL 的首字节被跳过（head 读到的是 NAL 头的第 2 字节）：
+			//   SPS(0x67)→0x42、IDR(0x65)→0x88（0x88&0x1F==8 恰为 PPS 类型）。
+			// 后果：参数集判据误报「SPS=false PPS=true」，而码流本身完全正常。
+			//   —— 实机证据：out_1536.h264 首 AU 4250 字节，NAL 序列
+			//   9(AUD) 7(SPS) 8(PPS) 6(SEI) 6(SEI) 5(IDR)，起始码偏移 0/6/35/43/98/344。
+			scStart := i
 			startLen := 3
-			end := i
-			if p[i-1] == 0 { // 4 字节起始码 00 00 00 01
-				end--
+			if i > 0 && p[i-1] == 0 { // 4 字节起始码 00 00 00 01
+				scStart = i - 1
 				startLen = 4
 			}
+			end := scStart // 本 NAL 载荷在下一个起始码之前结束
 			if end <= prev {
 				return fmt.Errorf("偏移 %d 处空 NAL", prev)
 			}
 			segs = append(segs, seg{prev, end})
-			prev = i + startLen
-			i += startLen - 1
+			prev = scStart + startLen // 下一个 NAL 载荷起点
+			i = prev - 1
 		}
 	}
 	if len(p) <= prev {
@@ -492,13 +508,34 @@ func checkAnnexB(p []byte, codec byte) error {
 	if len(segs) == 0 {
 		return errors.New("无 NAL")
 	}
-	// 首 NAL 类型
-	head := p[segs[0].start]
+	// 参数集在位：H.264 需 SPS(7)+PPS(8)；HEVC 需 VPS(32)+SPS(33)+PPS(34)
+	var seenSPS, seenPPS, seenVPS bool
+	for _, s := range segs {
+		head := p[s.start]
+		switch {
+		case codec == codecH264:
+			switch head & 0x1F {
+			case 7:
+				seenSPS = true
+			case 8:
+				seenPPS = true
+			}
+		case codec == codecH265:
+			switch (head >> 1) & 0x3F {
+			case 32:
+				seenVPS = true
+			case 33:
+				seenSPS = true
+			case 34:
+				seenPPS = true
+			}
+		}
+	}
 	switch {
-	case codec == codecH264 && head&0x1F != 7:
-		return fmt.Errorf("首 NAL 类型 %d 非 SPS(7)（关键帧应携带参数集）", head&0x1F)
-	case codec == codecH265 && (head>>1)&0x3F != 32:
-		return fmt.Errorf("首 NAL 类型 %d 非 VPS(32)（关键帧应携带参数集）", (head>>1)&0x3F)
+	case codec == codecH264 && !(seenSPS && seenPPS):
+		return fmt.Errorf("首帧缺参数集（SPS=%v PPS=%v，H.264 关键帧应携带 SPS(7)+PPS(8)）", seenSPS, seenPPS)
+	case codec == codecH265 && !(seenVPS && seenSPS && seenPPS):
+		return fmt.Errorf("首帧缺参数集（VPS=%v SPS=%v PPS=%v，HEVC 关键帧应携带 VPS(32)+SPS(33)+PPS(34)）", seenVPS, seenSPS, seenPPS)
 	}
 	return nil
 }

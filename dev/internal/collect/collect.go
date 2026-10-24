@@ -86,7 +86,9 @@ func osVersion() string {
 		}
 		return ""
 	case "windows":
-		return strings.TrimPrefix(runCmd("wmic", "os", "get", "version", "/value"), "Version=")
+		// Windows 11 已移除 wmic，原生 Win32 路径优先，wmic 仅作回退。
+		// 见 collect_windows.go。
+		return winOSVersion()
 	}
 	return ""
 }
@@ -107,7 +109,8 @@ func cpu() string {
 		}
 		return ""
 	case "windows":
-		return strings.TrimPrefix(runCmd("wmic", "cpu", "get", "name", "/value"), "Name=")
+		// Windows 11 已移除 wmic，原生 Win32 路径优先，wmic 仅作回退。
+		return winCPU()
 	}
 	return ""
 }
@@ -134,27 +137,16 @@ func memoryGB() int {
 			}
 		}
 	case "windows":
-		s := strings.TrimPrefix(runCmd("wmic", "OS", "get", "TotalVisibleMemorySize", "/value"), "TotalVisibleMemorySize=")
-		if n, err := strconv.ParseInt(strings.TrimSpace(s), 10, 64); err == nil {
-			return int(n / 1e6)
-		}
+		// Windows 11 已移除 wmic，原生 GlobalMemoryStatusEx 优先，wmic 仅作回退。
+		return winMemoryGB_()
 	}
 	return 0
 }
 
 func diskGB() int {
 	if runtime.GOOS == "windows" {
-		s := runCmd("wmic", "logicaldisk", "get", "size", "/value")
-		var total int64
-		for _, line := range strings.Split(s, "\n") {
-			line = strings.TrimSpace(line)
-			if strings.HasPrefix(line, "Size=") {
-				if n, err := strconv.ParseInt(strings.TrimPrefix(line, "Size="), 10, 64); err == nil {
-					total += n
-				}
-			}
-		}
-		return int(total / 1e9)
+		// Windows 11 已移除 wmic，原生 GetDiskFreeSpaceExW 优先，wmic 仅作回退。
+		return winDiskGB_()
 	}
 	if b, err := exec.Command("df", "-k", "/").Output(); err == nil {
 		lines := strings.Split(string(b), "\n")
@@ -189,7 +181,8 @@ func serialNo() string {
 		}
 		return ""
 	case "windows":
-		return strings.TrimPrefix(runCmd("wmic", "bios", "get", "serialnumber", "/value"), "SerialNumber=")
+		// Windows 11 已移除 wmic，注册表优先，wmic 仅作回退。
+		return winSerialNo()
 	}
 	return ""
 }

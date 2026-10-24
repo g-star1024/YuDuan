@@ -297,7 +297,7 @@
 - **副端**（rust/agent/src/tls.rs 修订）：pin 模式抓取**完整证书链**，按**叶证书**（链首）校验 SPKI，临时 CAfile 用整条链——修复了「叶证书当锚」在 CA 签发形态下链验证失败的问题（自签形态不受影响）。
 - **实测**（macOS，hub TLS :9443 / mTLS :9444）：① PIN 模式（CA 签发 + 全链）注册成功；② CAFILE 链式严格校验注册成功；③ 错误 pin 正确拒绝（SPKI 不匹配提示）；④ mTLS 强制客户端证书 + pin 双因子注册成功。
 
-### 8.3.14 Linux/Windows 原生编码器库（2026-10-24 落地，实机验证待真实机器）
+### 8.3.14 Linux/Windows 原生编码器库（2026-10-24 落地；MF 已 Windows 实机验证 ✅，VAAPI 运行时待 Linux GPU）
 
 `dev/encoder-vaapi/`（Linux）与 `dev/encoder-mf/`（Windows）按 §8.3.3 契约补齐三平台
 编码器矩阵（macOS=encoder-vt 已实机验证）：
@@ -307,12 +307,22 @@
   （BT.601 限幅）经 VAImage 直填 + vaPutImage；CQP（`YUDUAN_ENC_QP` 默认 26）；
   SPS/PPS 自建 RBSP（含防仿真字节）经 packed header（param=25/data=26）随 IDR 下发；
   双 surface ping-pong 单参考帧 CAVLC；每帧 vaSyncSurface 同步取码流段链。
-- **Media Foundation**（`yuduan_enc_mf.c`）：仅 h264（MFTEnumEx SYNCMFT 枚举系统
-  H264 编码器）；CBR（`YUDUAN_ENC_KBPS` 默认 4000）；GOP 经 ICodecAPI 强推关键帧；
-  MS H264 MFT 关键帧自带 in-band SPS/PPS；NEED_MORE_INPUT 管线期返 0 无 pending
-  （副端按丢弃重采，不死循环）；COM 线程约束=三函数同线程。
+- **Media Foundation**（`yuduan_enc_mf.c`，2026-10-24 Windows 11 实机重写并验证）：仅
+  h264（MFTEnumEx 枚举全部候选，逐个尝试——首选常是异步硬件 MFT，同步管线喂它恒
+  NEED_MORE_INPUT，须跳过取同步 MFT）；CBR（`YUDUAN_ENC_KBPS` 默认 4000）；GOP 经
+  ICodecAPI 强推关键帧；MS H264 MFT 关键帧自带 in-band SPS/PPS；COM 线程约束=三函数
+  同线程。**实机关键结论**：① MS H264 编码 MFT 固有 12 帧管线延迟，40+ 组 ICodecAPI
+  配置实测无低延迟旋钮（LowLatency/RealTime→E_NOTIMPL），采用与 encoder-vt 同构的
+  「预置 13 帧黑帧 + 输出队列」吸收（§8.3.8）；② 一次性塞 N 帧再 DRAIN 会丢帧（输入
+  队列有界），必须逐帧提交+逐帧拉取；③ 输出缓冲按 GetOutputStreamInfo 的 cbSize 分配；
+  ④ 输出类型必须自带分辨率/帧率，且 SetOutputType 先于 SetInputType；⑤ 纯 C 下
+  MFSetAttributeSize/Ratio 与 ICodecAPI::SetValue(VARIANT*) 需兼容层，扩展导出
+  `yuduan_enc_flush`（DRAIN 冲刷，会话收尾用）。
 - **验证分级（诚实标注）**：语法/类型检查 ✅（VA=vendored 真实 libva master 头
-  `-fsyntax-only`，ABI 对齐上游；MF=自写声明子集，目标机以 SDK 头为准）；运行时 ⏳
-  待 Linux GPU / Windows 实机（无环境时 create 返回 NULL，副端诚实回退 RAW_RGBA）。
+  `-fsyntax-only`，ABI 对齐上游；MF=自写声明子集）；**运行时：MF ✅ Windows 11 实机
+  全链路通过**（harness 直测 60 帧 + 系统 MS H264 解码 MFT 独立实解零错误 + 远控
+  relay 60 帧 15.3fps，报告见 `dev/verify-windows-report-20261024.md`）；**VA ⏳ 待
+  Linux GPU**（无环境时 create 返回 NULL，副端诚实回退 RAW_RGBA）。
 - **实机验证入口**：各自 README.md（构建脚本 + 冒烟 + e2e 复用
-  `e2e_vt_encoder.py`，`YUDUAN_ENCODER_LIB` 指向对应 so/dll）。
+  `e2e_vt_encoder.py`，`YUDUAN_ENCODER_LIB` 指向对应 so/dll）；Windows 全流程清单见
+  `dev/verify-windows.md`。
