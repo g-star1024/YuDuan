@@ -186,12 +186,17 @@ type RCCandidatePayload struct {
 
 // RCQosPayload —— Viewer→Hub→Agent 的服务质量反馈（§8.3.9 带宽自适应闭环）：
 // 主端根据本地解码/渲染实测（或用户调节）请求被控端的目标帧率；被控端夹取后应用，
-// 会话中途可多次发送（动态升降）。FPS=0 表示恢复 capabilities.fps 默认值。
+// 会话中途可多次发送（动态升降）。FPS 省略表示不改帧率目标；FPS=0 表示恢复默认。
+// §8.3.15：追加丢包率与实测码率——LossPct 为主端按帧序号缺口统计的丢帧率（整数 %，
+// TCP 传输下恒为 0，机制对齐未来 UDP 媒体路径与真实弱网）；Kbps 为主端实测接收码率。
+// 副端按丢包档位夹帧率，并据二者维护码率目标（丢包降档 / 恢复升档）。
 type RCQosPayload struct {
 	SessionID string `json:"session_id"`
-	FPS       int    `json:"fps"`
-	Reason    string `json:"reason,omitempty"` // decode_slow / user_slider / auto_adapt / rtt_probe ...
-	RTTMs     int64  `json:"rtt_ms,omitempty"` // 主端实测媒体路径 RTT（§8.3.11），副端按档位夹帧率上限
+	FPS       int    `json:"fps,omitempty"`
+	Reason    string `json:"reason,omitempty"`   // decode_slow / user_slider / auto_adapt / rtt_probe / loss_probe ...
+	RTTMs     int64  `json:"rtt_ms,omitempty"`   // 主端实测媒体路径 RTT（§8.3.11），副端按档位夹帧率上限
+	LossPct   int    `json:"loss_pct,omitempty"` // 主端实测丢帧率 %（§8.3.15），副端按档位夹帧率 + 码率降档
+	Kbps      int64  `json:"kbps,omitempty"`     // 主端实测接收码率 kbps（§8.3.15），副端码率升档参考
 }
 
 // RCPingPayload —— Viewer↔Agent 的 RTT 探测（§8.3.11）：主端发 t0=本地毫秒时间戳，

@@ -86,6 +86,10 @@
     let mediaTransport = 'relay';        // 浏览器无法监听裸 TCP：固定经中枢二进制中继
     let frameTimes = [];                 // 近 5s 帧到达时刻（fps）
     let byteWindow = [];                 // 近 1s 帧载荷（码率）
+    // —— §8.3.15 媒体实测（丢包率反馈）——
+    let lastFrameSeq = null;             // 上一帧序号（24B 头 seq 域，uint32 单调递增）
+    let lossFrames = 0;                  // 序号缺口累计丢帧数
+    let totalFrames = 0;                 // 已收帧数（丢包率分母）
     // —— §8.3.9 带宽自适应（rc_qos 反馈闭环）——
     let capsFps = 15;                    // 被控端能力宣告的帧率上限
     let qosFps = null;                   // 当前反馈给被控端的目标帧率（null=尚未反馈）
@@ -133,8 +137,10 @@
       while (byteWindow.length && now - byteWindow[0].t > 1000) byteWindow.shift();
       const fps = (frameTimes.length / 5).toFixed(1);
       const kbps = (byteWindow.reduce((s, x) => s + x.b, 0) / 1024).toFixed(0);
+      const lossPct = totalFrames > 0 ? Math.floor(lossFrames * 100 / (totalFrames + lossFrames)) : 0;
       document.getElementById('stats').textContent =
         `通道：${mediaTransport} · 编码：${CODEC_NAMES[codec] || codec} · 分辨率：${frameW}×${frameH} · ${fps} fps · ${kbps} KB/s` +
+        (lossFrames > 0 ? ` · 丢包 ${lossPct}%` : '') +
         (lastRtt !== null ? ` · RTT ${lastRtt}ms` : '');
     }
 
@@ -145,11 +151,18 @@
       qosLastSent = Date.now();
       const payload = { session_id: sessionID, fps, reason };
       if (lastRtt !== null) payload.rtt_ms = lastRtt; // §8.3.11：顺带反馈实测 RTT，副端按档位夹上限
+      // §8.3.15：顺带反馈实测丢包率（序号缺口）与接收码率（1s 窗口），
+      // 副端按丢包档位夹帧率 + 码率阶梯重参数化（原生 set_bitrate / JPEG 质量闭环）。
+      if (totalFrames > 0) payload.loss_pct = Math.floor(lossFrames * 100 / (totalFrames + lossFrames));
+      const winBytes = byteWindow.reduce((s, x) => s + x.b, 0);
+      if (winBytes > 0) payload.kbps = Math.round(winBytes * 8 / 1000);
       const env = { ver: 1, msg_id: 'm' + Date.now(), ts: Math.floor(Date.now() / 1000), type: 'rc_qos', seq: 1,
         payload };
       ws.send(JSON.stringify(env));
       document.getElementById('fpsVal').textContent = String(fps || capsFps);
-      log(`已发送 rc_qos：${fps === 0 ? '恢复默认' : fps + ' fps'}（${reason}${lastRtt !== null ? '，RTT ' + lastRtt + 'ms' : ''}）`);
+      const meas = (payload.loss_pct !== undefined || payload.kbps !== undefined)
+        ? `，丢包 ${payload.loss_pct ?? 0}% / ${payload.kbps ?? 0} kbps` : '';
+      log(`已发送 rc_qos：${fps === 0 ? '恢复默认' : fps + ' fps'}（${reason}${lastRtt !== null ? '，RTT ' + lastRtt + 'ms' : ''}${meas}）`);
     }
 
     // —— §8.3.11 传输级自适应：rc_ping/rc_pong RTT 探测（每 2s，会话内持续）——
@@ -237,6 +250,14 @@
       if (stream !== 0) return; // 仅屏幕流
       if (w > 0 && h > 0) { frameW = w; frameH = h; }
       countFrame(len, codec);
+      // §8.3.15 丢包实测：按帧序号缺口累计（TCP 传输下正常无缺口，机制对齐弱网/未来 UDP 路径）。
+      // 大跳（>1000，如会话重启 seq 归零）不计丢包。
+      if (lastFrameSeq !== null) {
+        const gap = (seq - lastFrameSeq) >>> 0;
+        if (gap > 1 && gap < 1000) lossFrames += gap - 1;
+      }
+      lastFrameSeq = seq;
+      totalFrames++;
       if (codec === 1) {
         // JPEG：Blob → Image → 画布（与 JSON 兜底路径同渲染，省去 base64 开销）
         const blob = new Blob([new Uint8Array(buf, FRAME_HEADER_LEN, len)], { type: 'image/jpeg' });

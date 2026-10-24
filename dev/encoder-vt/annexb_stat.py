@@ -4,6 +4,7 @@
 用法：
   python3 annexb_stat.py <file.h264|file.h265> [expected_w expected_h]
   python3 annexb_stat.py --probe <file> --codec h264 --w 1280 --h 720
+  python3 annexb_stat.py --selftest        # 黄金向量自检（防与 Go 侧实现漂移）
 
 职责：
   1. 校验起始码（00 00 00 01 / 00 00 01）、无空 NAL；
@@ -12,6 +13,11 @@
   4. 可选调用 ffprobe 交叉验证（宽高/帧数/关键帧）。
 
 作为编码器库的**可复现验证 fixture**：任何新编码器后端都必须能通过本脚本。
+
+⚠️ 双实现防漂移：本脚本的 split_annexb 与 Go 侧 dev/internal/annexb 是同一逻辑的
+两份实现（历史上 Go 侧曾出现 4 字节起始码 off-by-one 而本脚本一直正确，Windows
+实机验证发现）。防漂移机制：两侧共享同一组黄金向量——Go 见 internal/annexb/
+annexb_test.go，本脚本见 --selftest。改动任何一侧都必须同步向量并在另一侧复跑。
 """
 import re
 import subprocess
@@ -55,8 +61,55 @@ def nal_types(data: bytes, hevc: bool):
     return types, None
 
 
+GOLDEN_VECTORS = [
+    # (名称, hex, [(起始码长度, 载荷hex), ...]) —— 与 dev/internal/annexb/annexb_test.go 共享
+    ("全 4 字节起始码",
+     "0000000167abcd0000000168beef0000000165deadbeef",
+     [(4, "67abcd"), (4, "68beef"), (4, "65deadbeef")]),
+    ("全 3 字节起始码",
+     "00000167abcd00000168beef00000165dead",
+     [(3, "67abcd"), (3, "68beef"), (3, "65dead")]),
+    ("首 4 字节后续 3 字节混用",
+     "0000000167010203000001680506000001650708",
+     [(4, "67010203"), (3, "680506"), (3, "650708")]),
+    ("NAL 载荷尾部 0 紧邻下一起始码（易触发 off-by-one 的形态）",
+     "0000000165010200000001680304000000016709",
+     [(4, "650102"), (4, "680304"), (4, "6709")]),
+    ("H.264 关键帧 AU（AUD/SPS/PPS/SEI/IDR，Windows MF 实测形态）",
+     "00000001090000000167420000000168ce00000001062a0000000165abcd",
+     [(4, "09"), (4, "6742"), (4, "68ce"), (4, "062a"), (4, "65abcd")]),
+    ("末 NAL 无后继起始码",
+     "00000167aa5500000168bb",
+     [(3, "67aa55"), (3, "68bb")]),
+]
+
+
+def selftest() -> int:
+    """黄金向量自检：与 Go 侧 internal/annexb 共享同一组向量，防双实现漂移。
+
+    注意：本脚本会把 NAL 尾部对齐零 rstrip（cabac_zero_words），故向量载荷
+    均不含尾部零字节，保证两侧口径可比。"""
+    import binascii
+    failed = 0
+    for name, hexstr, want in GOLDEN_VECTORS:
+        data = binascii.unhexlify(hexstr)
+        got = [(scl, payload.hex()) for scl, payload in split_annexb(data)]
+        if got != [(scl, p) for scl, p in want]:
+            print(f"FAIL {name}: got={got} want={want}")
+            failed += 1
+        else:
+            print(f"PASS {name}: {len(want)} NAL")
+    if failed:
+        print(f"--selftest: {failed} 条向量失败（Go 侧同步复跑 go test ./internal/annexb）")
+        return 1
+    print(f"--selftest: {len(GOLDEN_VECTORS)} 条黄金向量全部通过")
+    return 0
+
+
 def main():
     args = sys.argv[1:]
+    if args[:1] == ["--selftest"]:
+        return selftest()
     if not args:
         print(__doc__)
         return 1

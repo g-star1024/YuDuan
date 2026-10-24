@@ -6,6 +6,8 @@
  *   uint32_t yuduan_enc_encode(void* h, const uint8_t* rgba, uint32_t rgba_len,
  *                              uint8_t* out, uint32_t out_cap);
  *   void     yuduan_enc_destroy(void* h);
+ * §8.3.15 可选导出（码率重参数化）：
+ *   void     yuduan_enc_set_bitrate(void* h, uint32_t kbps);
  *
  * 行为：
  *   - 仅接受 "h264" / "h265"（其余 codec 返回 NULL，供能力探测不虚标）；
@@ -62,6 +64,7 @@ static int vt_debug(void) {
 #include <stdio.h>
 
 void yuduan_enc_destroy(void *handle); /* 前置声明（create 失败清理用） */
+void yuduan_enc_set_bitrate(void *handle, uint32_t kbps); /* §8.3.15 可选导出 */
 
 /* 输出队列节点：回调即时入队，encode() 取队首（管线出帧，顺序与输入一致） */
 typedef struct outnode {
@@ -494,4 +497,18 @@ void yuduan_enc_destroy(void *handle) {
     }
     free(vt->ps_buf);
     free(vt);
+}
+
+/* §8.3.15 码率重参数化（可选导出）：会话中途调整目标码率。
+ * 经 VTSessionSetProperty 改 AverageBitRate（单位 bps），下一帧起生效；
+ * 句柄无效 / 会话未建 / kbps=0 时静默忽略（调用方以日志为准，无需返回值）。 */
+void yuduan_enc_set_bitrate(void *handle, uint32_t kbps) {
+    vt_enc *vt = (vt_enc *)handle;
+    if (!vt || !vt->session || kbps == 0) return;
+    int32_t bps = (int32_t)kbps * 1000;
+    CFNumberRef br = CFNumberCreate(NULL, kCFNumberIntType, &bps);
+    if (!br) return;
+    OSStatus st = VTSessionSetProperty(vt->session, kVTCompressionPropertyKey_AverageBitRate, br);
+    CFRelease(br);
+    DBG("set_bitrate %u kbps st=%d\n", kbps, (int)st);
 }

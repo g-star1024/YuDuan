@@ -20,8 +20,10 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
+	"yuduan/internal/annexb"
 	"yuduan/internal/proto"
 	"yuduan/internal/ws"
 )
@@ -51,6 +53,8 @@ func main() {
 	candidates := flag.Bool("candidates", true, "p2p 时广播本机候选地址（ICE-lite：被控端逐个尝试直连）")
 	qos := flag.Int("qos", 0, "协商后每 2s 向被控端发送 rc_qos 目标帧率（0=关闭；验证 §8.3.9 带宽自适应闭环）")
 	probe := flag.Bool("probe", false, "每 1s 发 rc_ping 探测 RTT（§8.3.11），并按 RTT 档位向被控端反馈帧率上限")
+	loss := flag.Int("loss", -1, "rc_qos 携带的丢包率 %（§8.3.15；-1=使用真实帧序号缺口测量；≥0 注入固定值，供 e2e 验证丢包档位策略）")
+	kbps := flag.Int64("kbps", 0, "rc_qos 携带的实测接收码率 kbps（§8.3.15；0=使用真实接收字节测量；>0 注入固定值，供 e2e 验证码率重参数化）")
 	flag.Parse()
 	if *device == "" {
 		fatal("需指定 -device（被控设备 ID）")
@@ -149,6 +153,7 @@ func main() {
 	selectSent := false
 	codecAdopted := false
 	lastQosByRtt := time.Time{} // §8.3.11：上次按 RTT 反馈的时刻（节流 2s）
+	meas := mediaMeas{}         // §8.3.15：媒体实测（帧序号缺口 → 丢包率；窗口字节 → 接收码率）
 
 	for got < *frames {
 		remaining := time.Until(deadline)
@@ -189,16 +194,25 @@ func main() {
 					if *transport == "p2p" && *candidates {
 						sendCandidates(conn, sessionID, ln)
 					}
-					// §8.3.9 带宽自适应闭环：反馈目标帧率（被控端逐轮应用，会话中途升降生效）。
+					// §8.3.9/§8.3.15 带宽自适应闭环：周期反馈帧率 + 媒体实测（丢包率/接收码率）。
 					// 首条立即发送（等 2s 的话低速用例收满前反馈根本到不了），此后每 2s 一次。
-					if *qos > 0 {
+					// 触发条件：-qos 开启，或 -loss/-kbps 注入（e2e 验证 §8.3.15 策略）。
+					if *qos > 0 || *loss >= 0 || *kbps > 0 {
 						go func() {
 							for i := 0; ; i++ {
 								if i > 0 {
 									time.Sleep(2 * time.Second)
 								}
+								lossPct, kbpsGot := meas.snapshot()
+								if *loss >= 0 {
+									lossPct = *loss
+								}
+								if *kbps > 0 {
+									kbpsGot = *kbps
+								}
 								q, err := proto.NewEnvelope(proto.TypeRCQos, 0, proto.RCQosPayload{
 									SessionID: sessionID, FPS: *qos, Reason: "p2pviewer-feedback",
+									LossPct: lossPct, Kbps: kbpsGot,
 								})
 								if err != nil {
 									return
@@ -207,7 +221,7 @@ func main() {
 								if err := conn.WriteMessage(qB); err != nil {
 									return
 								}
-								logf("已发送 rc_qos fps=%d", *qos)
+								logf("已发送 rc_qos fps=%d loss=%d%% kbps=%d", *qos, lossPct, kbpsGot)
 							}
 						}()
 					}
@@ -301,6 +315,7 @@ func main() {
 			}
 			got++
 			totalBytes += len(payload)
+			meas.record(frame[8:12], len(payload)) // 24B 头 seq 域（§8.3.15 实测）
 			saved := saveFrame(*out, got, codecGot, payload)
 			logf("帧 #%d ok: codec=%s %dx%d %d 字节载荷 → %s", got, codecName(codecGot), fw, fh, len(payload), saved)
 		}
@@ -452,92 +467,73 @@ func lastToken(s string) string {
 	return f[len(f)-1]
 }
 
+// mediaMeas 媒体实测（§8.3.15）：主端侧丢包率与接收码率测量。
+//   - 丢包率：二进制媒体帧 24B 头携带单调递增 seq（uint32），按序号缺口累计丢帧数；
+//     TCP 传输下正常无缺口（机制对齐未来 UDP 媒体路径与真实弱网），e2e 用注入值验证策略。
+//   - 接收码率：滑动窗口累计载荷字节，取样时按窗口时长折算 kbps（取样即清零窗口）。
+type mediaMeas struct {
+	mu          sync.Mutex
+	lastSeq     uint32
+	seqSeen     bool
+	lossFrames  int
+	totalFrames int
+	winBytes    int
+	winStart    time.Time
+}
+
+// record 记录一帧：seq 取自 24B 头 seq 域（b[8:12]），n 为载荷字节数。
+func (m *mediaMeas) record(seqB []byte, n int) {
+	if len(seqB) < 4 {
+		return
+	}
+	seq := binary.LittleEndian.Uint32(seqB)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.seqSeen {
+		gap := int64(int32(seq - m.lastSeq)) // 回绕安全差值；正常为 1
+		if gap > 1 {
+			m.lossFrames += int(gap - 1)
+		}
+	}
+	m.seqSeen = true
+	m.lastSeq = seq
+	m.totalFrames++
+	m.winBytes += n
+	if m.winStart.IsZero() {
+		m.winStart = time.Now()
+	}
+}
+
+// snapshot 取样：返回 (丢包率 %, 接收码率 kbps)；码率窗口取样后清零。
+func (m *mediaMeas) snapshot() (int, int64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var lossPct int
+	if m.lossFrames > 0 {
+		lossPct = m.lossFrames * 100 / (m.totalFrames + m.lossFrames)
+	}
+	var kbps int64
+	if !m.winStart.IsZero() {
+		if dt := time.Since(m.winStart).Seconds(); dt > 0.2 {
+			kbps = int64(float64(m.winBytes) * 8 / dt / 1000)
+		}
+		m.winBytes = 0
+		m.winStart = time.Now()
+	}
+	return lossPct, kbps
+}
+
 // checkAnnexB 校验 H.264/H.265 裸流：Annex-B 起始码切分 NAL，逐段非空，
 // 且首帧内参数集在位（H.264 需含 SPS(7)+PPS(8)；HEVC 需含 VPS(32)+SPS(33)+PPS(34)）。
 //
-// 注意：判据是「参数集在位」而非「首 NAL 必须是 SPS」——不同编码器的首帧形态不同：
+// 切分与校验逻辑已收口到 internal/annexb（权威实现）——本函数只是兼容包装。
+// ⚠️ 双实现防漂移：Python 侧镜像实现见 dev/encoder-vt/annexb_stat.py
+// （`--selftest` 共享同一组黄金向量）；改动任何一侧都必须同步另一侧。
+// 判据是「参数集在位」而非「首 NAL 必须 SPS」——不同编码器的首帧形态不同：
 // macOS VideoToolbox 首帧以 SPS 开头，而 Windows Media Foundation 会先输出
-// AUD(9) / SEI(6) 再到 SPS/PPS（见 dev/encoder-mf 实测）。两者都符合
-// dev/encoder-vt/README.md 与 annexb_stat.py 的判据口径，故此处按参数集在位判定。
+// AUD(9) / SEI(6) 再到 SPS/PPS（见 dev/encoder-mf 实测与 internal/annexb 文档）。
 func checkAnnexB(p []byte, codec byte) error {
-	if len(p) < 5 {
-		return errors.New("载荷过短")
-	}
-	var sc0 int
-	if p[0] == 0 && p[1] == 0 && p[2] == 0 && p[3] == 1 {
-		sc0 = 4
-	} else if p[0] == 0 && p[1] == 0 && p[2] == 1 {
-		sc0 = 3
-	} else {
-		return errors.New("缺起始码 00 00 00 01")
-	}
-	type seg struct{ start, end int }
-	var segs []seg
-	prev := sc0
-	for i := sc0; i+2 < len(p); i++ { // 从首起始码之后开始扫（避免把 4 字节起始码内部的 00 00 01 误判为新起始码）
-		if p[i] == 0 && p[i+1] == 0 && p[i+2] == 1 {
-			// 命中 3 字节窗口 00 00 01。若前一字节也是 0，则真实起始码是 4 字节
-			// 形态 00 00 00 01，其**起点在 i-1**（i 只是 00 00 01 的起始位置）。
-			// NAL 载荷起点 = 起始码起点 + 起始码长度，必须按此推算。
-			//
-			// ⚠️ 旧实现按 prev = i + startLen 推算，4 字节形态下多推进了 1 字节，
-			// 使每个 NAL 的首字节被跳过（head 读到的是 NAL 头的第 2 字节）：
-			//   SPS(0x67)→0x42、IDR(0x65)→0x88（0x88&0x1F==8 恰为 PPS 类型）。
-			// 后果：参数集判据误报「SPS=false PPS=true」，而码流本身完全正常。
-			//   —— 实机证据：out_1536.h264 首 AU 4250 字节，NAL 序列
-			//   9(AUD) 7(SPS) 8(PPS) 6(SEI) 6(SEI) 5(IDR)，起始码偏移 0/6/35/43/98/344。
-			scStart := i
-			startLen := 3
-			if i > 0 && p[i-1] == 0 { // 4 字节起始码 00 00 00 01
-				scStart = i - 1
-				startLen = 4
-			}
-			end := scStart // 本 NAL 载荷在下一个起始码之前结束
-			if end <= prev {
-				return fmt.Errorf("偏移 %d 处空 NAL", prev)
-			}
-			segs = append(segs, seg{prev, end})
-			prev = scStart + startLen // 下一个 NAL 载荷起点
-			i = prev - 1
-		}
-	}
-	if len(p) <= prev {
-		return errors.New("末尾空 NAL")
-	}
-	segs = append(segs, seg{prev, len(p)})
-	if len(segs) == 0 {
-		return errors.New("无 NAL")
-	}
-	// 参数集在位：H.264 需 SPS(7)+PPS(8)；HEVC 需 VPS(32)+SPS(33)+PPS(34)
-	var seenSPS, seenPPS, seenVPS bool
-	for _, s := range segs {
-		head := p[s.start]
-		switch {
-		case codec == codecH264:
-			switch head & 0x1F {
-			case 7:
-				seenSPS = true
-			case 8:
-				seenPPS = true
-			}
-		case codec == codecH265:
-			switch (head >> 1) & 0x3F {
-			case 32:
-				seenVPS = true
-			case 33:
-				seenSPS = true
-			case 34:
-				seenPPS = true
-			}
-		}
-	}
-	switch {
-	case codec == codecH264 && !(seenSPS && seenPPS):
-		return fmt.Errorf("首帧缺参数集（SPS=%v PPS=%v，H.264 关键帧应携带 SPS(7)+PPS(8)）", seenSPS, seenPPS)
-	case codec == codecH265 && !(seenVPS && seenSPS && seenPPS):
-		return fmt.Errorf("首帧缺参数集（VPS=%v SPS=%v PPS=%v，HEVC 关键帧应携带 VPS(32)+SPS(33)+PPS(34)）", seenVPS, seenSPS, seenPPS)
-	}
-	return nil
+	return annexb.Validate(p, codec == codecH264)
 }
 
 func payloadOK(env proto.Envelope) any {

@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -51,7 +52,10 @@ func run(hubURL string) error {
 	reg := proto.RegisterPayload{
 		Hostname: a.Hostname, OS: a.OS, OSVersion: a.OSVersion, Arch: a.Arch,
 		CPU: a.CPU, MemoryGB: a.MemoryGB, DiskGB: a.DiskGB, SerialNo: a.SerialNo,
-		MAC: a.MAC, IP: a.IP, AgentVersion: a.AgentVersion, Token: os.Getenv("YUDUAN_TOKEN"),
+		MAC: a.MAC, IP: a.IP, AgentVersion: a.AgentVersion,
+		// 设备身份持久化（Windows 实机验证报告建议项）：env 优先，其次本地状态文件。
+		// hub 按 token 复用设备身份——重启不再产生新设备条目（与 Rust 副端同构）。
+		Token: envOr("YUDUAN_TOKEN", loadAgentToken()),
 	}
 	if env, err := proto.NewEnvelope(proto.TypeRegister, nextSeq(), reg); err == nil {
 		if b, err := json.Marshal(env); err == nil {
@@ -72,6 +76,7 @@ func run(hubURL string) error {
 		return fmt.Errorf("register rejected")
 	}
 	os.Setenv("YUDUAN_TOKEN", ack.Token)
+	saveAgentState(ack.DeviceID, ack.Token) // 身份落盘，重启复用（失败不影响注册）
 	log.Printf("[agent] 注册成功 device_id=%s host=%s os=%s arch=%s", ack.DeviceID, a.Hostname, a.OS, a.Arch)
 
 	go func() {
@@ -207,4 +212,56 @@ func envOr(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// —— 设备身份持久化（与 Rust 副端 agentstate.rs 同构）——
+// 存储位置：YUDUAN_STATE_FILE 优先，否则 ~/.yuduan/agent-state.json。
+// 格式：{"device_id":"...","token":"..."}；损坏/缺失静默回退（重启即新身份）。
+
+func agentStatePath() string {
+	if p := os.Getenv("YUDUAN_STATE_FILE"); p != "" {
+		return p
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return ""
+	}
+	return filepath.Join(home, ".yuduan", "agent-state.json")
+}
+
+func loadAgentToken() string {
+	path := agentStatePath()
+	if path == "" {
+		return ""
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	var st struct {
+		DeviceID string `json:"device_id"`
+		Token    string `json:"token"`
+	}
+	if json.Unmarshal(b, &st) != nil {
+		return ""
+	}
+	if st.Token != "" {
+		log.Printf("[agent] 已恢复本地设备身份 device_id=%s（复用 token 注册；YUDUAN_STATE_FILE 可覆盖存储位置）", st.DeviceID)
+	}
+	return st.Token
+}
+
+func saveAgentState(deviceID, token string) {
+	path := agentStatePath()
+	if path == "" || token == "" {
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return
+	}
+	b, _ := json.Marshal(map[string]string{"device_id": deviceID, "token": token})
+	tmp := path + ".tmp"
+	if os.WriteFile(tmp, b, 0o600) == nil {
+		_ = os.Rename(tmp, path)
+	}
 }

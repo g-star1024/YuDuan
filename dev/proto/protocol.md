@@ -326,3 +326,59 @@
 - **实机验证入口**：各自 README.md（构建脚本 + 冒烟 + e2e 复用
   `e2e_vt_encoder.py`，`YUDUAN_ENCODER_LIB` 指向对应 so/dll）；Windows 全流程清单见
   `dev/verify-windows.md`。
+
+### 8.3.15 丢包率测量 + 码率动态重参数化（2026-10-24 落地，macOS 实测闭环）
+
+媒体环自适应的最后一块：RTT 档位（§8.3.11）之上补齐丢包信号与码率闭环。
+
+- **rc_qos 扩展**（主端→副端，全部可选字段）：`loss_pct`（整数 %，主端按 24B 帧头
+  seq 域缺口统计的丢帧率——TCP 传输下恒为 0，机制对齐弱网/未来 UDP 媒体路径）；
+  `kbps`（主端实测接收码率，1s 滑动窗口）。`fps` 改为省略=不改目标（此前恒发 0
+  会被当「恢复默认」，测量型反馈会误清用户设置）。
+- **丢包档位**（副端，与 RTT 档位取 min 后夹帧率）：≤2% 不限；≤5% 15fps；≤10%
+  8fps；>10% 4fps（`loss_cap_fps`）。
+- **码率目标阶梯**（副端 `next_target_kbps`）：丢包 ≥1% → 降档 ×0.8（下限 300
+  kbps；基准 = 当前目标 → 实测码率 → 默认 4000）；无丢包且已有目标且连续 3 次
+  报告无丢包 → 升档 ×1.25（上限 4000=编码器默认档，需更高由管理员显式配置）。
+- **应用路径**：
+  - 原生编码器：§8.3.3 契约新增**可选导出**
+    `void yuduan_enc_set_bitrate(void* h, uint32_t kbps)`——库未导出=不支持动态
+    重参数化（诚实降级）。副端在**编码同线程**应用（send_media_frame 内，MF 的
+    COM 线程约束要求 create/encode/set_bitrate 同线程）。encoder-vt 已实现
+    （VTSessionSetProperty AverageBitRate），encoder-vaapi/mf 后续补导出。
+  - JPEG 路径：码率目标换算单帧字节预算（kbps×间隔ms/8），上帧超预算 → 质量
+    降 10（下限 30），低于半预算 → 升 5（上限 92）；仅作用于 JPEG 通道/未协商帧。
+- **测量实现**：p2pviewer（`-loss N`/`-kbps N` 注入固定值供 e2e；缺省用真实
+  seq 缺口+窗口字节测量）+ rc.html（序号缺口统计 + 1s 窗口，状态栏显示丢包率，
+  周期 qos 顺带携带）。
+- **验证证据**：Rust 71/71（loss 档位/码率阶梯/质量闭环/rc_qos 应用单测）+ Go
+  全绿；e2e 实测（macOS，VT dylib 原生 h264 relay）：注入 loss=8%/kbps=1000 →
+  副端日志依次出现「丢包 8% → 帧率上限 8 fps」「码率目标 800 kbps」「原生编码器
+  码率重参数化 → 800 kbps」「码率闭环：预算 6600 B/帧 → 质量 80→70」。
+
+### 8.3.16 副端设备身份持久化（2026-10-24 落地，e2e 实测）
+
+hub 按 register 载荷的 token 复用设备身份（store.byToken）。此前 token 仅存内存，
+副端重启重新注册即产生**新设备条目**（设备列表漂移）。现状修复：
+
+- 副端把 `(device_id, token)` 落盘：`YUDUAN_STATE_FILE` 优先，默认
+  `~/.yuduan/agent-state.json`（HOME/USERPROFILE，三平台同构）；写临时文件后原子
+  改名；损坏/缺失静默回退（重启即新身份，不阻塞注册主流程）。
+- 注册载荷 token 回传 → hub 复用既有设备；Rust 生产副端（`agentstate.rs`）与 Go
+  参考副端（cmd/agent `loadAgentToken/saveAgentState`）同构实现，`YUDUAN_TOKEN`
+  环境变量优先级高于文件。
+- **验证证据**：副端两次启动 hub 日志同一 `device_id=25afd318…`（仅一条设备记录）；
+  Rust 单测覆盖保存/读回/损坏文件回退。
+
+### 8.3.17 Annex-B 切分实现收口（2026-10-24）
+
+Windows 实机验证发现的 Go 侧 off-by-one（4 字节起始码多跳 1 字节）源于 Go/Python
+双实现漂移。收口：
+
+- Go 权威实现 `dev/internal/annexb`（Split/Validate），p2pviewer 的 checkAnnexB
+  改为兼容包装；Python 侧 `dev/encoder-vt/annexb_stat.py` 保持独立实现。
+- **防漂移机制**：两侧共享 6 条黄金向量（含易触发 off-by-one 的「载荷尾部 0 紧邻
+  4 字节起始码」形态、Windows MF 实测 AUD/SPS/PPS/SEI/IDR 首帧形态）——Go 见
+  `internal/annexb/annexb_test.go`，Python 跑 `annexb_stat.py --selftest`；改动
+  任何一侧必须同步向量并在另一侧复跑。已知行为差异（有意保留）：Python 对 NAL
+  尾部对齐零 rstrip（统计显示口径），Go 保留原字节（校验口径）。

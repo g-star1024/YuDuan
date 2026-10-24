@@ -235,6 +235,9 @@ pub fn default_capabilities() -> Capabilities {
 pub trait Encoder: Send {
     fn encode(&mut self, rgba: &[u8], w: u32, h: u32) -> Result<Vec<u8>, String>;
     fn codec(&self) -> u8;
+    /// 会话中途码率重参数化（§8.3.15）。默认无操作：RAW/JPEG 透传路径不适用；
+    /// 原生编码器按库是否导出 yuduan_enc_set_bitrate 决定实际效果。
+    fn set_bitrate(&mut self, _kbps: u64) {}
 }
 
 /// 纯 Rust 回退：RAW_RGBA（零压缩，便于无原生库时仍走二进制帧通道）。
@@ -351,6 +354,10 @@ type EncEncode = unsafe extern "C" fn(
     std::os::raw::c_uint,
 ) -> std::os::raw::c_uint;
 type EncDestroy = unsafe extern "C" fn(*mut std::os::raw::c_void);
+/// 可选导出（§8.3.15 码率重参数化）：会话中途调整目标码率。
+/// 库未导出该符号 = 不支持动态重参数化（副端诚实记录，不重试不报错）。
+///   void yuduan_enc_set_bitrate(void* h, uint32_t kbps);
+type EncSetBitrate = unsafe extern "C" fn(*mut std::os::raw::c_void, std::os::raw::c_uint);
 
 /// 原生编码器封装：从 YUDUAN_ENCODER_LIB 动态库加载，按编解码器创建句柄。
 /// 句柄来自已加载的动态库且由本结构独占，断言 Send 以便跨线程持有（单线程使用）。
@@ -358,6 +365,7 @@ pub struct NativeEncoder {
     handle: *mut std::os::raw::c_void,
     encode: EncEncode,
     destroy: EncDestroy,
+    set_bitrate_fn: Option<EncSetBitrate>,
     codec: u8,
 }
 
@@ -374,6 +382,9 @@ impl NativeEncoder {
         let create = unsafe { std::mem::transmute::<*mut std::os::raw::c_void, EncCreate>(load_symbol(&lib, "yuduan_enc_create")?) };
         let encode = unsafe { std::mem::transmute::<*mut std::os::raw::c_void, EncEncode>(load_symbol(&lib, "yuduan_enc_encode")?) };
         let destroy = unsafe { std::mem::transmute::<*mut std::os::raw::c_void, EncDestroy>(load_symbol(&lib, "yuduan_enc_destroy")?) };
+        // §8.3.15：set_bitrate 为可选导出——缺失时该编码器不支持会话中途码率重参数化。
+        let set_bitrate_fn = unsafe { load_symbol(&lib, "yuduan_enc_set_bitrate") }
+            .map(|p| unsafe { std::mem::transmute::<*mut std::os::raw::c_void, EncSetBitrate>(p) });
         let codec_name = match codec {
             CODEC_H264 => "h264\0",
             CODEC_H265 => "h265\0",
@@ -391,6 +402,7 @@ impl NativeEncoder {
                 handle,
                 encode,
                 destroy,
+                set_bitrate_fn,
                 codec,
             })
         }
@@ -424,6 +436,11 @@ impl Encoder for NativeEncoder {
     }
     fn codec(&self) -> u8 {
         self.codec
+    }
+    fn set_bitrate(&mut self, kbps: u64) {
+        if let Some(f) = self.set_bitrate_fn {
+            unsafe { (f)(self.handle, kbps.min(u32::MAX as u64) as std::os::raw::c_uint) };
+        }
     }
 }
 

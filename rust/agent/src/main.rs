@@ -35,6 +35,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+mod agentstate;
 mod ed25519;
 mod httpget;
 mod jpegenc;
@@ -1292,6 +1293,17 @@ fn session(url: &str) -> std::io::Result<()> {
     let seq: Arc<Mutex<u64>> = Arc::new(Mutex::new(0));
     let registered: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
 
+    // 设备身份持久化（Windows 实机验证报告建议项）：恢复上次注册的 token，
+    // hub 按 token 复用设备身份——重启不再产生新设备条目。
+    let (saved_did, saved_tok) = agentstate::load();
+    if !saved_tok.is_empty() {
+        *token.lock().unwrap() = saved_tok;
+        eprintln!(
+            "[agent] 已恢复本地设备身份 device_id={}（复用 token 注册；YUDUAN_STATE_FILE 可覆盖存储位置）",
+            saved_did
+        );
+    }
+
     // 注册
     let assets = collect_assets();
     let reg_payload = {
@@ -1368,6 +1380,7 @@ fn session(url: &str) -> std::io::Result<()> {
                                 *token.lock().unwrap() = tok.clone();
                                 *registered.lock().unwrap() = true;
                                 eprintln!("[agent] 注册成功 device_id={} token={} ok={}", did, tok, ok);
+                                agentstate::save(&did, &tok); // 身份落盘，重启复用（不阻塞注册）
                             } else {
                                 eprintln!("[agent] register_ack 缺少 device_id（忽略）");
                             }

@@ -262,6 +262,16 @@ static RC_TARGET: std::sync::Mutex<Option<(u32, u32)>> = std::sync::Mutex::new(N
 static RC_FPS_QOS: AtomicU64 = AtomicU64::new(0);
 /// 主端实测媒体路径 RTT（ms，§8.3.11）；0 = 未知/未探测（不夹上限）。
 static RC_RTT_MS: AtomicU64 = AtomicU64::new(0);
+/// 主端实测丢帧率（%，§8.3.15，帧序号缺口统计）；0 = 无丢包/未上报。
+static RC_LOSS_PCT: AtomicU64 = AtomicU64::new(0);
+/// 连续无丢包的 rc_qos 报告次数（§8.3.15 码率恢复升档节流：连续 3 次才升一档）。
+static RC_LOSS_CLEAR: AtomicU64 = AtomicU64::new(0);
+/// 码率目标（kbps，§8.3.15）；0 = 未设置（编码器用默认码率）。
+static RC_KBPS_TARGET: AtomicU64 = AtomicU64::new(0);
+/// 已应用到编码器的码率目标（kbps）；仅用于检测变化避免重复调用原生 set_bitrate。
+static RC_KBPS_APPLIED: AtomicU64 = AtomicU64::new(0);
+/// JPEG 路径动态质量（§8.3.15 码率闭环换算）；新会话恢复 80（内置编码器默认档）。
+static RC_JPEG_Q: AtomicU64 = AtomicU64::new(80);
 
 // ===================== P2P / 二进制帧媒体环（§8.3 运行时接入） =====================
 
@@ -288,6 +298,11 @@ impl MediaChannel {
     fn codec(&self) -> u8 {
         match self {
             MediaChannel::P2p { codec, .. } | MediaChannel::Relay { codec, .. } => *codec,
+        }
+    }
+    fn encoder_mut(&mut self) -> &mut Box<dyn crate::rc_media::Encoder> {
+        match self {
+            MediaChannel::P2p { encoder, .. } | MediaChannel::Relay { encoder, .. } => encoder,
         }
     }
 }
@@ -550,6 +565,47 @@ pub fn handle_rc_qos(p: &crate::Json) {
             }
         }
     }
+    // §8.3.15 丢包档位：主端按帧序号缺口统计的丢帧率 → 帧率上限（与 RTT 档位取 min）。
+    let mut loss_val: Option<u64> = None;
+    if let Some(loss) = p.get("loss_pct").and_then(|v| v.as_i64()) {
+        if (0..=100).contains(&loss) {
+            loss_val = Some(loss as u64);
+            let prev = RC_LOSS_PCT.swap(loss as u64, Ordering::SeqCst);
+            match (loss_cap_fps(loss as u64), loss_cap_fps(prev)) {
+                (Some(now), Some(old)) if now != old => {
+                    eprintln!("[agent] rc_qos：丢包 {}% → 帧率上限 {} fps（原 {} fps）", loss, now, old);
+                }
+                (Some(cap), None) => {
+                    eprintln!("[agent] rc_qos：丢包 {}% → 帧率上限 {} fps（原无限制）", loss, cap);
+                }
+                (None, Some(_)) => {
+                    eprintln!("[agent] rc_qos：丢包 {}% → 网络良好，解除丢包帧率上限", loss);
+                }
+                _ => {}
+            }
+        }
+    }
+    // §8.3.15 码率重参数化：丢包降档 / 连续恢复升档；目标变化时由帧循环在编码
+    // 同线程应用（原生 set_bitrate；JPEG 路径换算为质量闭环）。
+    if let Some(loss) = loss_val {
+        let measured = p
+            .get("kbps")
+            .and_then(|v| v.as_i64())
+            .filter(|v| *v > 0)
+            .map(|v| v as u64)
+            .unwrap_or(0);
+        let prev = RC_KBPS_TARGET.load(Ordering::SeqCst);
+        let streak = RC_LOSS_CLEAR.load(Ordering::SeqCst);
+        let (next, new_streak) = next_target_kbps(prev, measured, loss, streak);
+        RC_LOSS_CLEAR.store(new_streak, Ordering::SeqCst);
+        if next != prev {
+            RC_KBPS_TARGET.store(next, Ordering::SeqCst);
+            eprintln!(
+                "[agent] rc_qos：码率目标 {} kbps（原 {}，实测 {} kbps，丢包 {}%）",
+                next, prev, measured, loss
+            );
+        }
+    }
 }
 
 /// 处理 rc_ping：主端 RTT 探测（§8.3.11）。原样回显 t0，主端 RTT = now - t0。
@@ -621,6 +677,17 @@ fn send_media_frame(
     if is_raw != (ch_codec != crate::rc_media::CODEC_JPEG) {
         return SendOutcome::Recapture;
     }
+    // §8.3.15 码率重参数化：目标变化时在编码同线程应用（MF 等 COM 约束要求
+    // create/encode/set_bitrate 同线程），原生编码器经可选导出生效；JPEG 路径
+    // 走质量闭环（见帧循环），RAW 无码率概念不适用。
+    let want_kbps = RC_KBPS_TARGET.load(Ordering::SeqCst);
+    if want_kbps > 0 && RC_KBPS_APPLIED.load(Ordering::SeqCst) != want_kbps {
+        guard
+            .as_mut()
+            .map(|ch| ch.encoder_mut().set_bitrate(want_kbps));
+        RC_KBPS_APPLIED.store(want_kbps, Ordering::SeqCst);
+        eprintln!("[agent] 原生编码器码率重参数化 → {} kbps", want_kbps);
+    }
     match guard.as_mut() {
         None => SendOutcome::NoChannel,
         Some(MediaChannel::P2p { stream, codec, encoder }) => {
@@ -677,6 +744,11 @@ pub fn start_rc(writer: Writer, rng: Arc<Mutex<crate::Lcg>>, seq: Arc<Mutex<u64>
     *RC_MEDIA.lock().unwrap() = None; // 新会话重新协商媒体通道
     *RC_TARGET.lock().unwrap() = None; // 新会话重新探测目标分辨率
     RC_FPS_QOS.store(0, Ordering::SeqCst); // 新会话清主端 QoS 反馈（恢复默认帧率）
+    RC_LOSS_PCT.store(0, Ordering::SeqCst); // §8.3.15：新会话丢包/码率目标复位
+    RC_LOSS_CLEAR.store(0, Ordering::SeqCst);
+    RC_KBPS_TARGET.store(0, Ordering::SeqCst);
+    RC_KBPS_APPLIED.store(0, Ordering::SeqCst);
+    RC_JPEG_Q.store(80, Ordering::SeqCst);
     *RC_SESSION.lock().unwrap() = Some(session_id.clone());
 
     // 合规：本地通知 + 事件（员工知情可拒绝；开发态自动授权见 rc_event）
@@ -750,6 +822,29 @@ pub fn start_rc(writer: Writer, rng: Arc<Mutex<crate::Lcg>>, seq: Arc<Mutex<u64>
             } else {
                 (data, w, h)
             };
+            // §8.3.15 JPEG 码率闭环：按码率目标换算单帧字节预算，动态调质量（下帧生效）。
+            // 仅作用于 JPEG 通道 / 未协商（JSON 兜底）帧——原生会话启动期的预采帧不适用。
+            if !raw_mode
+                && matches!(
+                    RC_MEDIA.lock().unwrap().as_ref(),
+                    None | Some(MediaChannel::Relay { codec: crate::rc_media::CODEC_JPEG, .. })
+                        | Some(MediaChannel::P2p { codec: crate::rc_media::CODEC_JPEG, .. })
+                )
+            {
+                let target = RC_KBPS_TARGET.load(Ordering::SeqCst);
+                if target > 0 {
+                    let budget = target * interval_ms / 8; // kbps×ms/8 ≈ 字节/帧
+                    let prev_q = RC_JPEG_Q.load(Ordering::SeqCst);
+                    let q = next_jpeg_q(prev_q, data.len(), budget);
+                    if q != prev_q {
+                        RC_JPEG_Q.store(q, Ordering::SeqCst);
+                        eprintln!(
+                            "[agent] 码率闭环：目标 {} kbps 预算 {} B/帧，上帧 {} B → 质量 {}→{}",
+                            target, budget, data.len(), prev_q, q
+                        );
+                    }
+                }
+            }
             // 二进制媒体环（§8.3）：已协商通道 → 按协商 codec 编码采集帧 → 二进制帧。
             match send_media_frame(&writer, &data, w, h, frame_seq, started.elapsed().as_millis() as u32, raw_mode) {
                 SendOutcome::Sent => continue,
@@ -819,6 +914,13 @@ fn rc_frame_interval_ms() -> u64 {
     } else {
         fps
     };
+    // §8.3.15 丢包档位：与 RTT 档位取 min（两个独立信号，任一拥塞即生效）。
+    let loss = RC_LOSS_PCT.load(Ordering::SeqCst);
+    let fps = if loss > 0 {
+        fps.min(loss_cap_fps(loss).unwrap_or(fps))
+    } else {
+        fps
+    };
     (1000 / fps).max(1)
 }
 
@@ -833,6 +935,62 @@ fn rtt_cap_fps(rtt_ms: u64) -> Option<u64> {
         Some(8)
     } else {
         Some(4)
+    }
+}
+
+/// 丢包率 → 帧率上限档位（§8.3.15）。None = 无丢包/轻微丢包不夹。
+/// 档位：≤2% 不限；≤5% 15fps；≤10% 8fps；>10% 4fps。
+fn loss_cap_fps(loss_pct: u64) -> Option<u64> {
+    if loss_pct <= 2 {
+        None
+    } else if loss_pct <= 5 {
+        Some(15)
+    } else if loss_pct <= 10 {
+        Some(8)
+    } else {
+        Some(4)
+    }
+}
+
+/// 编码器默认码率档（kbps）：与 encoder-mf/encoder-vt 的 YUDUAN_ENC_KBPS 默认值一致，
+/// 同时作为码率升档上限（自适应只降不超默认，需要更高码率由管理员显式配置编码器）。
+const DEFAULT_TARGET_KBPS: u64 = 4000;
+const MIN_TARGET_KBPS: u64 = 300;
+
+/// 码率目标阶梯（§8.3.15）。返回 (新目标, 新的连续无丢包计数)。
+///   - 丢包 ≥1%：降档 ×0.8（下限 300 kbps）；基准 = 当前目标 → 实测码率 → 默认 4000。
+///   - 无丢包且已有目标且连续 3 次报告无丢包：升档 ×1.25（上限 4000），计数清零。
+///   - 其余保持原值（prev=0 表示编码器用默认码率，不主动抬高）。
+fn next_target_kbps(prev: u64, measured_kbps: u64, loss_pct: u64, clear_streak: u64) -> (u64, u64) {
+    if loss_pct >= 1 {
+        let base = if prev > 0 {
+            prev
+        } else if measured_kbps > 0 {
+            measured_kbps
+        } else {
+            DEFAULT_TARGET_KBPS
+        };
+        ((base * 4 / 5).max(MIN_TARGET_KBPS), 0)
+    } else if prev > 0 && prev < DEFAULT_TARGET_KBPS && clear_streak >= 3 {
+        ((prev * 5 / 4).min(DEFAULT_TARGET_KBPS), 0)
+    } else {
+        (prev, clear_streak + 1)
+    }
+}
+
+/// JPEG 质量闭环（§8.3.15）：把码率目标换算为单帧字节预算（kbps × 间隔ms / 8 ≈ 字节），
+/// 上帧超出预算 → 质量降 10（下限 30）；低于预算一半 → 升 5（上限 92）；其余不变。
+/// budget=0（未设目标）不调节。
+fn next_jpeg_q(prev_q: u64, frame_len: usize, budget_bytes: u64) -> u64 {
+    if budget_bytes == 0 {
+        return prev_q;
+    }
+    if frame_len as u64 > budget_bytes {
+        prev_q.saturating_sub(10).max(30)
+    } else if frame_len as u64 * 2 < budget_bytes {
+        (prev_q + 5).min(92)
+    } else {
+        prev_q
     }
 }
 
@@ -1544,7 +1702,12 @@ fn capture_jpeg() -> Option<(Vec<u8>, usize, usize)> {
         } else {
             (rgba, w, h)
         };
-        if let Some(jpeg) = crate::jpegenc::encode_rgba(&data, tw as u32, th as u32, 80) {
+        if let Some(jpeg) = crate::jpegenc::encode_rgba(
+            &data,
+            tw as u32,
+            th as u32,
+            RC_JPEG_Q.load(Ordering::SeqCst).clamp(10, 95) as u32,
+        ) {
             return Some((jpeg, tw, th));
         }
         // 编码失败：落 CLI 兜底（不产出错误码流）
@@ -1880,6 +2043,81 @@ mod tests {
 
         std::env::remove_var("YUDUAN_RC_FPS");
         let _ = d;
+    }
+
+    #[test]
+    fn rc_loss_cap_and_bitrate_policy() {
+        // §8.3.15 丢包档位 + 码率阶梯（纯函数 + 原子量，不碰 env）。
+        // 档位边界：≤2% 不限，≤5% → 15，≤10% → 8，>10% → 4
+        assert_eq!(loss_cap_fps(0), None);
+        assert_eq!(loss_cap_fps(2), None);
+        assert_eq!(loss_cap_fps(3), Some(15));
+        assert_eq!(loss_cap_fps(5), Some(15));
+        assert_eq!(loss_cap_fps(6), Some(8));
+        assert_eq!(loss_cap_fps(10), Some(8));
+        assert_eq!(loss_cap_fps(11), Some(4));
+
+        // 码率阶梯：丢包触发降档（基准 prev → 实测 → 默认 4000），下限 300
+        assert_eq!(next_target_kbps(0, 0, 8, 0), (3200, 0));
+        assert_eq!(next_target_kbps(0, 1000, 8, 0), (800, 0));
+        assert_eq!(next_target_kbps(3200, 0, 3, 0), (2560, 0));
+        assert_eq!(next_target_kbps(350, 0, 50, 0), (300, 0), "降档下限 300");
+        // 无丢包：计数增长；连续 3 次后升档 ×1.25（上限 4000），计数清零
+        assert_eq!(next_target_kbps(800, 0, 0, 0), (800, 1));
+        assert_eq!(next_target_kbps(800, 0, 0, 2), (800, 3));
+        assert_eq!(next_target_kbps(800, 0, 0, 3), (1000, 0));
+        assert_eq!(next_target_kbps(3900, 0, 0, 3), (4000, 0), "升档上限 4000");
+        assert_eq!(next_target_kbps(4000, 0, 0, 3), (4000, 4), "已达上限不再动");
+        assert_eq!(next_target_kbps(0, 0, 0, 5), (0, 6), "未设目标不主动抬高");
+
+        // JPEG 质量闭环：超预算降 10（下限 30）、低于半预算升 5（上限 92）、budget=0 不动
+        assert_eq!(next_jpeg_q(80, 10_000, 5_000), 70);
+        assert_eq!(next_jpeg_q(35, 10_000, 5_000), 30, "质量下限 30");
+        assert_eq!(next_jpeg_q(80, 1_000, 5_000), 85);
+        assert_eq!(next_jpeg_q(90, 1_000, 5_000), 92, "质量上限 92");
+        assert_eq!(next_jpeg_q(80, 4_000, 5_000), 80, "预算内不变");
+        assert_eq!(next_jpeg_q(80, 1_000, 0), 80, "未设目标不调节");
+    }
+
+    #[test]
+    fn rc_qos_loss_and_kbps_apply() {
+        // §8.3.15：rc_qos.loss_pct/kbps 到达 → 丢包档位原子量 + 码率目标阶梯生效；
+        // 越界载荷忽略；interval 与 RTT 档位取 min。
+        RC_FPS_QOS.store(0, Ordering::SeqCst);
+        RC_RTT_MS.store(0, Ordering::SeqCst);
+        RC_LOSS_PCT.store(0, Ordering::SeqCst);
+        RC_LOSS_CLEAR.store(0, Ordering::SeqCst);
+        RC_KBPS_TARGET.store(0, Ordering::SeqCst);
+        std::env::remove_var("YUDUAN_RC_FPS");
+
+        // 丢包 8% + 实测 1000 kbps：帧率上限 8fps + 码率目标 1000*4/5=800
+        let p: crate::Json =
+            crate::parse_json(br#"{"session_id":"s","loss_pct":8,"kbps":1000}"#).expect("载荷应可解析");
+        handle_rc_qos(&p);
+        assert_eq!(RC_LOSS_PCT.load(Ordering::SeqCst), 8);
+        assert_eq!(RC_KBPS_TARGET.load(Ordering::SeqCst), 800);
+        assert_eq!(rc_frame_interval_ms(), 125, "丢包 8% 应夹到 8fps（125ms）");
+
+        // 越界丢包（负数/>100）：不应用
+        for bad in [br#"{"loss_pct":-1}"#.as_slice(), br#"{"loss_pct":101}"#, br#"{"loss_pct":"x"}"#] {
+            let p: crate::Json = crate::parse_json(bad).expect("越界载荷本身应可解析");
+            handle_rc_qos(&p);
+            assert_eq!(RC_LOSS_PCT.load(Ordering::SeqCst), 8, "越界丢包不应改变当前值");
+        }
+
+        // 连续 4 次无丢包报告：码率 800 → 1000（恢复升档）
+        let ok: crate::Json = crate::parse_json(br#"{"loss_pct":0}"#).expect("载荷应可解析");
+        for _ in 0..4 {
+            handle_rc_qos(&ok);
+        }
+        assert_eq!(RC_KBPS_TARGET.load(Ordering::SeqCst), 1000);
+
+        // 收尾复位（防影响并行测试的其他用例）
+        RC_LOSS_PCT.store(0, Ordering::SeqCst);
+        RC_LOSS_CLEAR.store(0, Ordering::SeqCst);
+        RC_KBPS_TARGET.store(0, Ordering::SeqCst);
+        RC_KBPS_APPLIED.store(0, Ordering::SeqCst);
+        RC_JPEG_Q.store(80, Ordering::SeqCst);
     }
 
     #[test]
