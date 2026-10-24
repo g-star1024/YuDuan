@@ -296,3 +296,23 @@
 - **中枢**：`certs/ca.pem` 存在即自动 CA 模式（证书缺失自动签发、SAN 补本机主机名、启动到期告警、优先下发 chain.pem 全链）；无 CA 退回一次性自签（开发态）。ECDSA P-256，根 10 年 / 叶 1 年，根 MaxPathLen=0（扁平链）。
 - **副端**（rust/agent/src/tls.rs 修订）：pin 模式抓取**完整证书链**，按**叶证书**（链首）校验 SPKI，临时 CAfile 用整条链——修复了「叶证书当锚」在 CA 签发形态下链验证失败的问题（自签形态不受影响）。
 - **实测**（macOS，hub TLS :9443 / mTLS :9444）：① PIN 模式（CA 签发 + 全链）注册成功；② CAFILE 链式严格校验注册成功；③ 错误 pin 正确拒绝（SPKI 不匹配提示）；④ mTLS 强制客户端证书 + pin 双因子注册成功。
+
+### 8.3.14 Linux/Windows 原生编码器库（2026-10-24 落地，实机验证待真实机器）
+
+`dev/encoder-vaapi/`（Linux）与 `dev/encoder-mf/`（Windows）按 §8.3.3 契约补齐三平台
+编码器矩阵（macOS=encoder-vt 已实机验证）：
+
+- **VAAPI**（`yuduan_enc_va.c`）：仅 h264（Constrained Baseline→Main→High 逐级探测建
+  config）；DRM headless（`YUDUAN_VA_DRM_DEVICE`，默认 renderD128）；RGBA→NV12
+  （BT.601 限幅）经 VAImage 直填 + vaPutImage；CQP（`YUDUAN_ENC_QP` 默认 26）；
+  SPS/PPS 自建 RBSP（含防仿真字节）经 packed header（param=25/data=26）随 IDR 下发；
+  双 surface ping-pong 单参考帧 CAVLC；每帧 vaSyncSurface 同步取码流段链。
+- **Media Foundation**（`yuduan_enc_mf.c`）：仅 h264（MFTEnumEx SYNCMFT 枚举系统
+  H264 编码器）；CBR（`YUDUAN_ENC_KBPS` 默认 4000）；GOP 经 ICodecAPI 强推关键帧；
+  MS H264 MFT 关键帧自带 in-band SPS/PPS；NEED_MORE_INPUT 管线期返 0 无 pending
+  （副端按丢弃重采，不死循环）；COM 线程约束=三函数同线程。
+- **验证分级（诚实标注）**：语法/类型检查 ✅（VA=vendored 真实 libva master 头
+  `-fsyntax-only`，ABI 对齐上游；MF=自写声明子集，目标机以 SDK 头为准）；运行时 ⏳
+  待 Linux GPU / Windows 实机（无环境时 create 返回 NULL，副端诚实回退 RAW_RGBA）。
+- **实机验证入口**：各自 README.md（构建脚本 + 冒烟 + e2e 复用
+  `e2e_vt_encoder.py`，`YUDUAN_ENCODER_LIB` 指向对应 so/dll）。

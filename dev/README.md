@@ -53,8 +53,8 @@ dev/
 ├── e2e_pg.py               # PostgreSQL + 多中枢总线端到端验证（17 项：连接池/参数化/去粘性/WORM 触发器/持久化）
 ├── e2e_vt_encoder.py       # 真实原生编码器端到端验证（10 项：h264/h265 真码流 + P 帧 + ffmpeg 零错误解码 + QoS 限帧）
 ├── encoder-vt/             # macOS VideoToolbox 原生编码器动态库 + 直测 fixture（见 encoder-vt/README.md）
-├── encoder-vaapi/          # Linux VAAPI 原生编码器库（§8.3.13；离线语法自检 + 目标机构建脚本）
-├── encoder-mf/             # Windows Media Foundation 原生编码器库（§8.3.13；同上）
+├── encoder-vaapi/          # Linux VAAPI 原生编码器库（§8.3.14；离线语法自检 + 目标机构建脚本）
+├── encoder-mf/             # Windows Media Foundation 原生编码器库（§8.3.14；同上）
 ├── fixtures/               # 编码器验证桩（yuduan_enc_stub.c，§8.3.4 契约形状）
 ├── cmd/ca/                 # 私有 CA 管理工具（init / issue-server / issue-client / pin / check）
 ├── cmd/recreplay/          # 加密录像回放工具（.yrec 解密导出 + ffmpeg 外部校验）
